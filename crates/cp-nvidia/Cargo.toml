@@ -1,0 +1,17 @@
+[package]
+name = "cp-nvidia"
+description = "Bindings to NVIDIA runtimes: Optical Flow (NVOFA), NGX (DLSS NR), Video Effects SDK (VFG)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+windows.workspace = true
+windows-core.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

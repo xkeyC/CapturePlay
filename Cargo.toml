@@ -1,0 +1,82 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "GPL-3.0-or-later"
+publish = false
+
+[workspace.dependencies]
+cp-core = { path = "crates/cp-core" }
+cp-capture = { path = "crates/cp-capture" }
+cp-audio = { path = "crates/cp-audio" }
+cp-render = { path = "crates/cp-render" }
+cp-nvidia = { path = "crates/cp-nvidia" }
+
+anyhow = "1.0"
+thiserror = "2.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+serde = { version = "1.0", features = ["derive"] }
+toml = "1.1"
+bytemuck = { version = "1.20", features = ["derive"] }
+parking_lot = "0.12"
+crossbeam-channel = "0.5"
+rtrb = "0.3"
+winit = "0.30.13"
+egui = { version = "0.37", features = ["bytemuck"] }
+egui-winit = { version = "0.37", default-features = false, features = ["clipboard", "links"] }
+raw-window-handle = "0.6"
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D12",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Gdi",
+    "Win32_Devices_Display",
+    "Win32_Media_MediaFoundation",
+    "Win32_Media_Audio",
+    "Win32_Media_Multimedia",
+    "Win32_Media_KernelStreaming",
+    "Win32_Media",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Variant",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Performance",
+    "Win32_System_Threading",
+    "Win32_System_WindowsProgramming",
+    "Win32_Security",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_HiDpi",
+    "Win32_Devices_FunctionDiscovery",
+    "Win32_Devices_Properties",
+    "Win32_UI_Shell_PropertiesSystem",
+    "Win32_Globalization",
+] }
+windows-core = "0.62"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+unused_must_use = "deny"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+undocumented_unsafe_blocks = "warn"
+dbg_macro = "warn"
+todo = "warn"
+unwrap_used = "warn"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+debug = "line-tables-only"
+panic = "abort"
+
+[profile.dev.package."*"]
+opt-level = 2

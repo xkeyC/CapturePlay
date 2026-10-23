@@ -1,0 +1,18 @@
+[package]
+name = "cp-audio"
+description = "Capture-card audio passthrough (WASAPI) with drift-corrected low latency."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+windows.workspace = true
+windows-core.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+rtrb.workspace = true
+
+[lints]
+workspace = true

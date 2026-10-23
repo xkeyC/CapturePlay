@@ -1,0 +1,21 @@
+[package]
+name = "cp-capture"
+description = "Capture-card video input via Media Foundation."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+cp-core.workspace = true
+windows.workspace = true
+windows-core.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+anyhow.workspace = true

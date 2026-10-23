@@ -1,0 +1,5 @@
+/target
+
+# Third-party runtimes (NVIDIA VFG etc.) are installed locally, never committed.
+/runtime/*
+!/runtime/README.md

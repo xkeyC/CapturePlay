@@ -1,0 +1,23 @@
+[package]
+name = "cp-render"
+description = "D3D12 renderer: upload, color conversion, interpolation, HDR presentation, egui overlay."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+build = "build.rs"
+
+[dependencies]
+cp-core.workspace = true
+cp-capture.workspace = true
+cp-nvidia.workspace = true
+windows.workspace = true
+windows-core.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+bytemuck.workspace = true
+egui.workspace = true
+
+[lints]
+workspace = true
