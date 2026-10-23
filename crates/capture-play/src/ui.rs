@@ -19,8 +19,6 @@ pub enum Action {
     RestartCapture,
     SettingsChanged,
     ToggleFullscreen,
-    /// A/B split: left = selected backend, right = the other one.
-    SetCompare(bool),
     SetFreeze(bool),
 }
 
@@ -45,7 +43,6 @@ pub struct UiView<'a> {
     pub rates: &'a Rates,
     pub adapter: &'a str,
     pub interp: BackendStatus,
-    pub compare: bool,
     pub frozen: bool,
     pub audio: Option<&'a AudioView>,
 }
@@ -187,11 +184,10 @@ pub fn draw(ctx: &egui::Context, s: &mut Settings, v: &UiView<'_>) -> Vec<Action
             egui::CollapsingHeader::new(t.interpolation).default_open(true).show(ui, |ui| {
                 let label = |b: InterpolationBackend| match b {
                     InterpolationBackend::Off => t.interp_off,
-                    InterpolationBackend::NvOpticalFlow => t.interp_nvof,
                     InterpolationBackend::NvidiaVfg => t.interp_vfg,
                 };
                 egui::ComboBox::from_label(t.backend).selected_text(label(s.interpolation.backend)).show_ui(ui, |ui| {
-                    for b in [InterpolationBackend::Off, InterpolationBackend::NvOpticalFlow, InterpolationBackend::NvidiaVfg] {
+                    for b in [InterpolationBackend::Off, InterpolationBackend::NvidiaVfg] {
                         changed |= ui.selectable_value(&mut s.interpolation.backend, b, label(b)).changed();
                     }
                 });
@@ -210,16 +206,10 @@ pub fn draw(ctx: &egui::Context, s: &mut Settings, v: &UiView<'_>) -> Vec<Action
                     });
                 }
                 ui.label(format!("{}: {}", t.status, status_label(t, v.interp)));
-                ui.horizontal(|ui| {
-                    let mut compare = v.compare;
-                    if ui.checkbox(&mut compare, t.compare).on_hover_text(t.compare_hint).changed() {
-                        actions.push(Action::SetCompare(compare));
-                    }
-                    let mut frozen = v.frozen;
-                    if ui.checkbox(&mut frozen, t.freeze).changed() {
-                        actions.push(Action::SetFreeze(frozen));
-                    }
-                });
+                let mut frozen = v.frozen;
+                if ui.checkbox(&mut frozen, t.freeze).changed() {
+                    actions.push(Action::SetFreeze(frozen));
+                }
             });
 
             egui::CollapsingHeader::new(t.audio).default_open(false).show(ui, |ui| {

@@ -79,10 +79,10 @@ impl ColorSettings {
 pub enum InterpolationBackend {
     /// No interpolation; lowest latency.
     Off,
-    /// NVIDIA Optical Flow hardware + compute warp (RTX 20+).
+    /// NVIDIA Video Effects SDK AI frame generation (RTX 40/50). The removed
+    /// optical-flow backend's name maps here so old settings files load.
     #[default]
-    NvOpticalFlow,
-    /// NVIDIA Video Effects SDK AI frame generation (RTX 40+).
+    #[serde(alias = "nv_optical_flow")]
     NvidiaVfg,
 }
 
@@ -217,6 +217,13 @@ fps = 60
         .expect("parse");
         assert!(s.color.assume_hdr_for_10bit);
         assert_eq!(s.interpolation.max_multiplier, 2);
+    }
+
+    #[test]
+    fn removed_optical_flow_backend_maps_to_vfg() {
+        let s: Settings =
+            toml::from_str("[interpolation]\nbackend = \"nv_optical_flow\"\n").expect("parse");
+        assert_eq!(s.interpolation.backend, InterpolationBackend::NvidiaVfg);
     }
 
     #[test]

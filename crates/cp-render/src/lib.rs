@@ -13,7 +13,6 @@ pub mod display;
 pub mod egui_pass;
 pub mod gpu;
 pub mod gpu_timer;
-pub mod interp_nvof;
 pub mod interp_vfg;
 pub mod output;
 pub mod presenter;
@@ -22,9 +21,11 @@ pub mod shaders;
 pub mod texture;
 pub mod upload;
 
+#[cfg(test)]
+mod testutil;
+
 pub use display::DisplayInfo;
 pub use egui_pass::EguiFrame;
-pub use interp_nvof::NvofInterpolator;
 pub use interp_vfg::VfgInterpolator;
 pub use presenter::PresentResult;
 pub use renderer::{

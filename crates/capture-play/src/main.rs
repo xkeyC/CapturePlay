@@ -9,6 +9,7 @@
 
 mod app;
 mod config;
+mod cursor;
 mod i18n;
 mod render_thread;
 mod ui;

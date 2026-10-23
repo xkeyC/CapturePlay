@@ -12,7 +12,7 @@ Rust + Direct3D 12，单进程、单交换链，Windows 10/11。
 | 目标 | 做法 | 实测（RTX 4090，AVerMedia LGU 2.1，PS5 30 fps 游戏） |
 |---|---|---|
 | 低延迟 | 事件驱动节奏、单次拷贝采集、可等待交换链 MaxFrameLatency=1 | 到达→呈现 ≈ **15.3 ms**（30→60 理论下限 16.7 ms 的半帧） |
-| 高效补帧 | 先去重找回真实 30 fps，再插值；两种后端可切换 | 每帧插值 GPU：光流 **1.46 ms**，VFG 均衡 **1.80 ms**（1440p） |
+| 高效补帧 | 先去重找回真实 30 fps，再用 NVIDIA VFG（AI）插值 | 每帧插值 GPU：VFG 均衡 **1.80 ms**（1440p） |
 | 原生 HDR | 固定 FP16 scRGB 交换链 + 每次 Resize 后重设输出合约 | 全屏/窗口反复切换 HDR 不丢失 |
 | 工程治理 | 6 个职责单一的 crate，纯逻辑全部单元测试，clippy 零警告 | 42 个单元测试 |
 | 可选增强 | `Enhancer` 扩展点（色彩转换后、补帧前） | 预留给官方 SDK（如 DLSS 神经渲染公开后） |
@@ -26,7 +26,7 @@ Rust + Direct3D 12，单进程、单交换链，Windows 10/11。
    (一次拷贝, 指纹)        (持久映射上传堆)                         │
                                                               Enhancer (预留)
                                                                     │
-                                 Pacer(事件驱动) ──▶ Interpolator(NvOF | VFG) ──▶ OutputPass
+                                 Pacer(事件驱动) ──▶ Interpolator(VFG) ──▶ OutputPass
                                                                     (缩放+色调映射)
                                                                           │
  WASAPI 采集 ──SPSC 环形缓冲──▶ WASAPI 输出                       EguiPass ──▶ FP16 scRGB 交换链
@@ -39,7 +39,7 @@ Rust + Direct3D 12，单进程、单交换链，Windows 10/11。
 | `cp-capture` | Media Foundation 采集：设备枚举、格式选择、异步读取、色彩识别、厂商控制 |
 | `cp-audio` | WASAPI 音频直通、采集卡端点匹配、时钟漂移校正 |
 | `cp-render` | D3D12：上传、转换、补帧后端、输出映射、交换链/HDR、egui 渲染、GPU 计时 |
-| `cp-nvidia` | NVIDIA 运行时的动态绑定：Optical Flow、CUDA driver 子集、Video Effects (VFG) |
+| `cp-nvidia` | NVIDIA 运行时的动态绑定：CUDA driver 子集、Video Effects (VFG) |
 | `capture-play` | 应用：窗口、线程编排、UI（中/英）、设置持久化 |
 
 线程模型：主线程只跑窗口消息；渲染线程拥有设备、交换链、采集会话与 UI。窗口拖动/缩放的模态循环不会阻塞画面；渲染线程在一个事件 + 高精度可等待定时器上休眠，按节奏器给出的截止时间唤醒（普通超时有 15.6 ms 系统时钟粒度，实测会丢帧）。
@@ -92,34 +92,39 @@ FLIP_DISCARD、3 缓冲、`SetMaximumFrameLatency(1)`、可等待对象在录制
 
 已实测：4K 全屏 ↔ 窗口多次切换，每次 Resize 后都重新应用输出合约，显示器保持 HDR，补帧节奏不中断。
 
-## 5. 补帧后端
+## 5. 补帧：NVIDIA Video Frame Generation（`interp_vfg`，RTX 40/50，AI 模型）
 
-### 5.1 NVIDIA Optical Flow + warp（`interp_nvof`，RTX 20+）
-- 光流在 ≤1920 宽的分辨率上计算（1440p/4K 先 2× 下采样），8-bit PQ 感知亮度作为输入，`Fast` 档，grid 2。
-- 一次 `NV_OF_PRED_DIRECTION_BOTH` 同时得到 A→B 与 B→A。
-- `densify`：3×3 向量中值去离群 + 由 cost 换算置信度。
-- `warp`：对时刻 t 用松弛 Picard 迭代求两侧回溯位置，按前后向一致性（遮挡）与置信度加权混合；两侧都不可靠时退化为交叉淡化。
-- 光流按帧对缓存，同一帧对的多个中间帧只算一次；亮度按帧 id 缓存，每个新帧只算一次。
-- 与 NVOFA 引擎之间只用 fence 同步，无 CPU 等待。
-- `nvofapi64.dll` 随显卡驱动提供；绑定按 Optical Flow SDK 5.0 头文件（MIT）手写，结构体布局有单元测试。
-
-### 5.2 NVIDIA Video Frame Generation（`interp_vfg`，RTX 40/50，AI 模型）
 - 帧直接编码进 D3D12 与 CUDA 共享的缓冲区（`D3D12_HEAP_FLAG_SHARED` → `cuImportExternalMemory`），RGB10A2：HDR 内容用 PQ/BT.2020，SDR 内容用 sRGB。
 - 同步：D3D12 队列 Signal(producer) → CUDA 流 Wait → `NvVFX_Run` → CUDA Signal(completion) → D3D12 队列 Wait。全程无 CPU 拷贝、无 CPU 等待。
 - 使用 `Timestep` 模式，任意 t 都可生成，与节奏器的时间模型一致。
 - 关闭 SDK 自带镜头切换检测（会让每次 Run 产生 CPU 同步）。
 - 运行时 DLL 不在仓库中，见 `runtime/README.md`。
+- 插值后端通过 `Interpolator` trait 接入，可再扩展。
 
-### 5.3 实测对比（30→60，同一游戏画面，release）
+### 5.1 性能（30→60，同一游戏画面，release，RTX 4090）
 
-| 后端 | 1440p P010 每帧 GPU | 4K NV12 每帧 GPU | 到达→呈现 |
+| 模型 | 1440p P010 每帧 GPU | 4K NV12 每帧 GPU | 到达→呈现 |
 |---|---|---|---|
-| 光流 + warp | 1.46 ms | 2.90 ms | ≈15.3 ms |
-| VFG 快速 | 0.95 ms | — | ≈15.3 ms |
-| VFG 均衡 | 1.80 ms | 2.12 ms | ≈15.4 ms |
-| VFG 高质量 | 8.29 ms | — | ≈16.0 ms |
+| 快速 | 0.95 ms | — | ≈15.3 ms |
+| 均衡（默认） | 1.80 ms | 2.12 ms | ≈15.4 ms |
+| 高质量 | 8.29 ms | — | ≈16.0 ms |
 
-GPU 时间用时间戳查询测量，包含 NVOFA/CUDA 跨引擎部分。光流管线最初在 1440p 上为 9.54 ms，改为半分辨率 + Fast 后降到 1.46 ms。两种后端都远低于 16.7 ms 预算，在 4090 上选择依据应是画质。UI 提供 **A/B 分屏**（插值帧左/右半分别来自两种后端）和 **定格插值帧**（P 键）用于主观对比。
+GPU 时间用时间戳查询测量，包含 CUDA 跨引擎部分。UI 提供 **定格插值帧**（P 键）用于检查伪影。
+
+### 5.2 画质：真值测试与“为什么不用 NVIDIA Optical Flow”
+
+`cargo test -p cp-render -- --ignored --nocapture` 运行 GPU 真值测试：用可在连续坐标上求值的合成纹理生成 A/B 两帧（运动精确已知），把插值帧与 t=0.5 的真值比较（PSNR，越高越好），重点看**遮挡区**（运动物体边缘，重影出现的地方）。
+
+早期版本另有一个 NVIDIA Optical Flow（NVOFA 硬件光流 + 自写 warp）后端。真值测试表明光流本身精确（已知平移 (40,−20) 测得 (40.000, −20.000)），但块匹配光流在物体边界天然模糊：
+
+| 方案（1440p，物体移动 (60,20)） | 物体边缘带 PSNR |
+|---|---|
+| 两帧直接混合 | 16.4 dB |
+| 光流 + 反向 warp | 18.9 dB |
+| 光流 + 前向投影（遮挡感知） | 22.3 dB |
+| VFG 快速 / 均衡 / 高质量 | 26.1 / 27.8 / 32.6 dB |
+
+即使改为遮挡感知的前向投影，光流方案在边缘仍比 VFG 均衡低约 6 dB，GPU 耗时却相近，因此被移除。测试也定位并修复了它的一个崩溃：注册给 NVOFA 的资源在 `nvOFDestroy` 之后释放会访问冲突（运行中切换后端时闪退）。
 
 ## 6. 音频
 
@@ -137,7 +142,7 @@ GPU 时间用时间戳查询测量，包含 NVOFA/CUDA 跨引擎部分。光流�
 
 ## 8. 构建与运行
 
-需求：Windows 10/11 x64，Rust 1.95+（MSVC 工具链），Windows SDK（`dxc.exe`，构建时编译 HLSL 为签名 DXIL；可用 `DXC_PATH` 指定），D3D12 显卡；补帧需要 NVIDIA 显卡（光流 RTX 20+，VFG RTX 40/50）。
+需求：Windows 10/11 x64，Rust 1.95+（MSVC 工具链），Windows SDK（`dxc.exe`，构建时编译 HLSL 为签名 DXIL；可用 `DXC_PATH` 指定），D3D12 显卡；补帧需要 NVIDIA RTX 40/50 显卡与 VFG 运行时。
 
 ```powershell
 cargo build --release
@@ -153,6 +158,8 @@ cargo build --release
 | 退出全屏 | Esc |
 | 定格插值帧 | P |
 
+鼠标在画面上静止 2 秒后自动隐藏（悬停在面板上时不隐藏），移动即恢复。
+
 设置保存在 `%APPDATA%\CapturePlay\settings.toml`，日志在同目录 `capture-play.log`（`CAPTUREPLAY_LOG=debug` 提高级别，`CAPTUREPLAY_D3D_DEBUG=1` 启用 D3D12 调试层）。UI 支持中文/英文，默认跟随系统语言。
 
 ## 9. 相对参考项目（Veyra-NRVideo）的取舍
@@ -164,7 +171,7 @@ cargo build --release
 | 采集 | DirectShow + 自写 COM 滤镜 | Media Foundation 异步读取 |
 | 节奏 | 固定前瞻的时间线 | 事件驱动，半帧延迟下限，去重后插值 |
 | HDR | 色彩空间只设一次 → 全屏后丢失 | 固定 scRGB + 每次 Resize 重设，显示器状态只升不误降 |
-| 补帧 | 多后端，含针对签名 DLL 的内存补丁/架构伪装 | 只用官方、可正常加载的运行时（驱动自带 NVOFA；官方 VFG） |
+| 补帧 | 多后端，含针对签名 DLL 的内存补丁/架构伪装 | 只用官方、可正常加载的运行时（NVIDIA VFG），画质用真值测试量化 |
 | DLSS 5 NR | 依赖未公开功能与对 NVIDIA 访问限制的规避 | 不实现；保留 `Enhancer` 接口等待官方 SDK |
 
 ## 10. 已知限制与后续
@@ -179,7 +186,7 @@ cargo build --release
 本项目以 **GPL-3.0-or-later** 发布，见 [LICENSE](LICENSE)。
 
 仓库**不包含**任何专有 SDK、头文件或运行时。运行时按需动态加载：
-- 随 NVIDIA 显卡驱动提供：`nvofapi64.dll`（Optical Flow）、`nvcuda.dll`（CUDA driver）。
+- 随 NVIDIA 显卡驱动提供：`nvcuda.dll`（CUDA driver）。
 - 用户自行安装：NVIDIA Video Effects SDK 运行时（VFG），见 `runtime/README.md`，受 NVIDIA 许可约束。
 
-NVIDIA Optical Flow 与 CUDA 的 FFI 声明依据 NVIDIA 以 MIT 许可发布的头文件及公开文档手写。分发捆绑专有运行时的二进制包前，请自行评估 GPL 兼容性（例如为这些运行时添加 GPLv3 第 7 节的附加许可）。
+CUDA 的 FFI 声明依据 NVIDIA 公开的头文件与文档手写。分发捆绑专有运行时的二进制包前，请自行评估 GPL 兼容性（例如为这些运行时添加 GPLv3 第 7 节的附加许可）。

@@ -9,10 +9,11 @@ use cp_core::settings::Settings;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{Fullscreen, Window, WindowId};
 
+use crate::cursor::CursorIdle;
 use crate::render_thread::{self, RenderHandle};
 
 /// Requests from the render thread to the window thread.
@@ -42,6 +43,10 @@ struct App {
     egui_state: Option<egui_winit::State>,
     render: Option<RenderHandle>,
     last_click: Option<Instant>,
+    /// Shared with the render thread; used to keep the cursor while it is
+    /// over the overlay.
+    egui_ctx: Option<egui::Context>,
+    cursor: CursorIdle,
 }
 
 impl App {
@@ -62,6 +67,12 @@ impl App {
         self.window
             .as_ref()
             .is_some_and(|w| w.fullscreen().is_some())
+    }
+
+    fn set_cursor_visible(&self, visible: bool) {
+        if let Some(w) = &self.window {
+            w.set_cursor_visible(visible);
+        }
     }
 
     fn shutdown(&mut self, event_loop: &ActiveEventLoop) {
@@ -123,6 +134,7 @@ impl ApplicationHandler<ToMain> for App {
             }
         };
         let ctx = egui::Context::default();
+        let ctx_for_cursor = ctx.clone();
         let state = egui_winit::State::new(
             ctx.clone(),
             egui::ViewportId::ROOT,
@@ -149,9 +161,14 @@ impl ApplicationHandler<ToMain> for App {
         }
         self.window = Some(window);
         self.egui_state = Some(state);
+        self.egui_ctx = Some(ctx_for_cursor);
         if fullscreen {
             self.set_fullscreen(true);
         }
+    }
+
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        self.update_cursor(event_loop);
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: ToMain) {
@@ -160,6 +177,11 @@ impl ApplicationHandler<ToMain> for App {
             ToMain::Platform(out) => {
                 if let (Some(w), Some(s)) = (&self.window, &mut self.egui_state) {
                     s.handle_platform_output(w, *out);
+                    // egui sets the cursor icon (and thereby shows it) every
+                    // frame; keep it hidden while idle.
+                    if self.cursor.hidden() {
+                        w.set_cursor_visible(false);
+                    }
                 }
             }
             ToMain::Exit => self.shutdown(event_loop),
@@ -180,6 +202,18 @@ impl ApplicationHandler<ToMain> for App {
                 self.send(ToRender::DisplayChanged)
             }
             _ => {}
+        }
+        let show_cursor = match &event {
+            WindowEvent::CursorMoved { position, .. } => {
+                self.cursor.moved(Instant::now(), (position.x, position.y))
+            }
+            WindowEvent::MouseInput { .. } | WindowEvent::MouseWheel { .. } => {
+                self.cursor.activity(Instant::now())
+            }
+            _ => false,
+        };
+        if show_cursor {
+            self.set_cursor_visible(true);
         }
 
         let response = self
@@ -224,6 +258,21 @@ impl ApplicationHandler<ToMain> for App {
     }
 }
 
+impl App {
+    /// Hides the cursor after it has been idle over the video.
+    fn update_cursor(&mut self, event_loop: &ActiveEventLoop) {
+        let over_ui = self
+            .egui_ctx
+            .as_ref()
+            .is_some_and(egui::Context::is_pointer_over_egui);
+        let (hide, deadline) = self.cursor.poll(Instant::now(), over_ui);
+        if hide {
+            self.set_cursor_visible(false);
+        }
+        event_loop.set_control_flow(deadline.map_or(ControlFlow::Wait, ControlFlow::WaitUntil));
+    }
+}
+
 impl std::fmt::Debug for ToMain {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -243,6 +292,8 @@ pub fn run(settings: Settings) -> Result<()> {
         egui_state: None,
         render: None,
         last_click: None,
+        egui_ctx: None,
+        cursor: CursorIdle::new(Instant::now()),
     };
     event_loop.run_app(&mut app)?;
     Ok(())

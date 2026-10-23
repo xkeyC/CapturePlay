@@ -73,27 +73,6 @@ const SHADERS: &[Shader] = &[
         defines: &[],
     },
     Shader {
-        file: "interp.hlsl",
-        entry: "densify",
-        profile: "cs_6_0",
-        out: "interp_densify",
-        defines: &[],
-    },
-    Shader {
-        file: "interp.hlsl",
-        entry: "warp",
-        profile: "cs_6_0",
-        out: "interp_warp",
-        defines: &[],
-    },
-    Shader {
-        file: "interp.hlsl",
-        entry: "luma",
-        profile: "cs_6_0",
-        out: "interp_luma",
-        defines: &[],
-    },
-    Shader {
         file: "vfg.hlsl",
         entry: "main",
         profile: "cs_6_0",

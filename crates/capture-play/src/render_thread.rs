@@ -317,32 +317,6 @@ impl State {
         self.renderer.reset_source();
     }
 
-    /// Creates the "other" backend for the A/B split.
-    fn set_compare(&mut self, on: bool) {
-        let other: Option<Box<dyn cp_render::Interpolator>> = if !on {
-            None
-        } else {
-            match self.settings.interpolation.backend {
-                InterpolationBackend::NvidiaVfg => {
-                    cp_render::NvofInterpolator::new(self.renderer.gpu())
-                        .ok()
-                        .map(|i| Box::new(i) as Box<_>)
-                }
-                _ => cp_render::VfgInterpolator::new(
-                    self.renderer.gpu(),
-                    vfg_runtime_dir(&self.settings),
-                    self.settings.interpolation.vfg_quality,
-                )
-                .ok()
-                .map(|i| Box::new(i) as Box<_>),
-            }
-        };
-        if on && other.is_none() {
-            tracing::warn!("compare backend unavailable");
-        }
-        self.renderer.set_compare_interpolator(other);
-    }
-
     /// (Re)creates the interpolation backend when the selection changed.
     fn apply_interpolator(&mut self) {
         let want = (
@@ -356,15 +330,6 @@ impl State {
         let want = want.0;
         let interp: Option<Box<dyn cp_render::Interpolator>> = match want {
             InterpolationBackend::Off => None,
-            InterpolationBackend::NvOpticalFlow => {
-                match cp_render::NvofInterpolator::new(self.renderer.gpu()) {
-                    Ok(i) => Some(Box::new(i)),
-                    Err(e) => {
-                        tracing::warn!("optical flow interpolation unavailable: {e}");
-                        None
-                    }
-                }
-            }
             InterpolationBackend::NvidiaVfg => {
                 let dir = vfg_runtime_dir(&self.settings);
                 match cp_render::VfgInterpolator::new(
@@ -381,10 +346,6 @@ impl State {
             }
         };
         self.renderer.set_interpolator(interp);
-        // The comparison backend is always "the other one".
-        if self.renderer.compare_name().is_some() {
-            self.set_compare(true);
-        }
     }
 
     fn apply_settings(&mut self) {
@@ -450,7 +411,6 @@ impl State {
                 self.start_capture();
             }
             Action::SettingsChanged => self.apply_settings(),
-            Action::SetCompare(on) => self.set_compare(on),
             Action::SetFreeze(on) => self.renderer.set_freeze(on),
             Action::ToggleFullscreen => {
                 let on = !self.settings.display.start_fullscreen;
@@ -646,7 +606,6 @@ fn run(
                     rates: &meter.rates,
                     adapter: &adapter,
                     interp,
-                    compare: st.renderer.compare_name().is_some(),
                     frozen: st.renderer.frozen(),
                     audio: audio.as_ref(),
                 };

@@ -11,5 +11,5 @@ Lookup order for the VFG runtime: `interpolation.vfg_runtime_dir` in
 executable or in any parent directory of it (so `target/release` builds find
 this folder).
 
-NVIDIA Optical Flow (`nvofapi64.dll`) and CUDA (`nvcuda.dll`) ship with the
-display driver and need nothing here.
+The CUDA driver (`nvcuda.dll`) ships with the display driver and needs
+nothing here.

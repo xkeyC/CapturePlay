@@ -307,3 +307,36 @@ impl Interpolator for VfgInterpolator {
         result
     }
 }
+
+/// Ground-truth occlusion scene (moving object over a static background,
+/// see `testutil`); needs the
+/// VFG runtime in `runtime/nvidia-vfg`. Run with
+/// `cargo test -p cp-render -- --ignored --nocapture`.
+#[cfg(test)]
+mod gpu_tests {
+    use super::*;
+    use crate::testutil::{Harness, occlusion_with};
+
+    #[test]
+    #[ignore = "requires an RTX 40/50 GPU and the VFG runtime"]
+    fn occlusion_moving_object_vfg() {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../runtime/nvidia-vfg");
+        for mode in 0..3u32 {
+            for (w, h) in [(1920, 1080), (2560, 1440)] {
+                for (dx, dy) in [(24.0, 0.0), (60.0, 20.0)] {
+                    let make = |hs: &Harness| -> Box<dyn Interpolator> {
+                        let mut i =
+                            VfgInterpolator::new(&hs.gpu, dir.clone(), mode).expect("VFG runtime");
+                        // Test images span 0..2 scRGB: use that as SDR white.
+                        i.set_content(false, 2.0);
+                        Box::new(i)
+                    };
+                    let (all, all_blend, edge, edge_blend) = occlusion_with(&make, w, h, dx, dy);
+                    println!(
+                        "VFG mode {mode} {w}x{h} object motion ({dx},{dy}): full {all:.1} dB (blend {all_blend:.1}) | edges {edge:.1} dB (blend {edge_blend:.1})"
+                    );
+                }
+            }
+        }
+    }
+}

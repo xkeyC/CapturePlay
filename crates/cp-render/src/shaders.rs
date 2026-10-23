@@ -21,9 +21,6 @@ pub const OUTPUT_VS: &[u8] = shader!("output_vs");
 pub const OUTPUT_PS: &[u8] = shader!("output_ps");
 pub const EGUI_VS: &[u8] = shader!("egui_vs");
 pub const EGUI_PS: &[u8] = shader!("egui_ps");
-pub const INTERP_LUMA: &[u8] = shader!("interp_luma");
-pub const INTERP_DENSIFY: &[u8] = shader!("interp_densify");
-pub const INTERP_WARP: &[u8] = shader!("interp_warp");
 pub const VFG_ENCODE: &[u8] = shader!("vfg_encode");
 pub const VFG_DECODE: &[u8] = shader!("vfg_decode");
 

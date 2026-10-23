@@ -117,7 +117,7 @@ pub struct RecordCtx<'a> {
     pub heap: &'a Rc<StagingHeap>,
     pub ring: &'a mut GpuDescriptorRing,
     pub list: &'a ID3D12GraphicsCommandList,
-    allocator: &'a ID3D12CommandAllocator,
+    pub(crate) allocator: &'a ID3D12CommandAllocator,
 }
 
 impl RecordCtx<'_> {
@@ -202,8 +202,6 @@ pub struct Renderer {
     pool: Vec<PooledFrame>,
     interp_out: Option<Texture>,
     interpolator: Option<Box<dyn Interpolator>>,
-    compare: Option<Box<dyn Interpolator>>,
-    compare_out: Option<Texture>,
     freeze: Freeze,
     enhancer: Option<Box<dyn Enhancer>>,
     /// Next enhanced frame must reset temporal history.
@@ -287,8 +285,6 @@ impl Renderer {
             pool: Vec::new(),
             interp_out: None,
             interpolator: None,
-            compare: None,
-            compare_out: None,
             freeze: Freeze::Off,
             enhancer: None,
             enhance_reset: true,
@@ -711,9 +707,7 @@ impl Renderer {
         Ok(r)
     }
 
-    /// Runs the primary backend into `interp_out` and, in compare mode, the
-    /// secondary one into `compare_out`, pasting its right half over the
-    /// primary result (left = primary, right = secondary).
+    /// Runs the interpolation backend into `interp_out`.
     fn run_interpolation(&mut self, prev: u64, next: u64, t: f32) -> Result<bool> {
         let (Some(pi), Some(ni)) = (
             self.pool.iter().position(|p| p.id == Some(prev)),
@@ -722,61 +716,29 @@ impl Renderer {
             return Ok(false);
         };
         let (w, h) = (self.pool[ni].tex.width, self.pool[ni].tex.height);
-        for out in [&mut self.interp_out, &mut self.compare_out] {
-            if out.as_ref().is_none_or(|t| t.width != w || t.height != h) {
-                *out = Some(Texture::new(
-                    &self.gpu,
-                    &self.heap,
-                    TextureDesc::new(w, h, WORKING_FORMAT).uav(),
-                )?);
-            }
+        if self
+            .interp_out
+            .as_ref()
+            .is_none_or(|t| t.width != w || t.height != h)
+        {
+            self.interp_out = Some(Texture::new(
+                &self.gpu,
+                &self.heap,
+                TextureDesc::new(w, h, WORKING_FORMAT).uav(),
+            )?);
         }
-        let Some(mut primary) = self.interpolator.take() else {
+        let Some(mut interp) = self.interpolator.take() else {
             return Ok(false);
         };
-        let ok = self.run_backend(primary.as_mut(), pi, ni, prev, next, t, false);
-        if ok {
-            self.interpolator = Some(primary);
-        } else {
-            tracing::error!(
-                "interpolation backend {} failed, disabling it",
-                primary.name()
-            );
-            return Ok(false);
-        }
-        if let Some(mut secondary) = self.compare.take() {
-            if self.run_backend(secondary.as_mut(), pi, ni, prev, next, t, true) {
-                self.compare = Some(secondary);
-                self.paste_right_half(w, h);
-            } else {
-                tracing::error!("compare backend {} failed, disabling it", secondary.name());
-            }
-        }
-        Ok(true)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn run_backend(
-        &mut self,
-        interp: &mut dyn Interpolator,
-        pi: usize,
-        ni: usize,
-        prev: u64,
-        next: u64,
-        t: f32,
-        compare: bool,
-    ) -> bool {
         let hdr = self.stats.color.is_some_and(|c| c.is_hdr());
         interp.set_content(
             hdr,
             self.decode_params().sdr_white_nits / cp_core::color::SCRGB_UNIT_NITS,
         );
-        let out = if compare {
-            self.compare_out.as_ref()
-        } else {
-            self.interp_out.as_ref()
-        };
-        let Some(out) = out else { return false };
+        let out = self
+            .interp_out
+            .as_ref()
+            .ok_or_else(windows::core::Error::empty)?;
         let f = &self.frames[self.frame_index];
         let mut ctx = RecordCtx {
             gpu: &self.gpu,
@@ -798,52 +760,19 @@ impl Renderer {
             t,
             out,
         );
-        if let Err(e) = &r {
-            tracing::error!("{}: {e}", interp.name());
+        match r {
+            Ok(()) => {
+                self.interpolator = Some(interp);
+                Ok(true)
+            }
+            Err(e) => {
+                tracing::error!(
+                    "interpolation backend {} failed, disabling it: {e}",
+                    interp.name()
+                );
+                Ok(false)
+            }
         }
-        r.is_ok()
-    }
-
-    fn paste_right_half(&mut self, w: u32, h: u32) {
-        let (Some(dst), Some(src)) = (self.interp_out.as_ref(), self.compare_out.as_ref()) else {
-            return;
-        };
-        let mut b = Vec::new();
-        dst.transition(&mut b, D3D12_RESOURCE_STATE_COPY_DEST);
-        src.transition(&mut b, D3D12_RESOURCE_STATE_COPY_SOURCE);
-        crate::texture::flush_barriers(&self.list, &mut b);
-        let loc = |t: &Texture| D3D12_TEXTURE_COPY_LOCATION {
-            pResource: crate::gpu::borrow_com(&t.resource),
-            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                SubresourceIndex: 0,
-            },
-        };
-        let half = w / 2;
-        let region = D3D12_BOX {
-            left: half,
-            top: 0,
-            front: 0,
-            right: w,
-            bottom: h,
-            back: 1,
-        };
-        // SAFETY: both textures are live, same size and format.
-        unsafe {
-            self.list
-                .CopyTextureRegion(&loc(dst), half, 0, 0, &loc(src), Some(&region))
-        };
-    }
-
-    /// Side-by-side comparison: left half = primary backend, right half =
-    /// `compare` (interpolated frames only).
-    pub fn set_compare_interpolator(&mut self, compare: Option<Box<dyn Interpolator>>) {
-        let _ = self.gpu.wait_idle();
-        self.compare = compare;
-    }
-
-    pub fn compare_name(&self) -> Option<&'static str> {
-        self.compare.as_ref().map(|i| i.name())
     }
 
     /// Freezes on the next interpolated frame (`true`) or resumes.

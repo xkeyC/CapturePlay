@@ -169,7 +169,17 @@ impl Gpu {
         heap: D3D12_HEAP_TYPE,
         state: D3D12_RESOURCE_STATES,
     ) -> Result<ID3D12Resource> {
-        let desc = buffer_desc(size, D3D12_RESOURCE_FLAG_NONE);
+        self.create_buffer_with(size, heap, state, D3D12_RESOURCE_FLAG_NONE)
+    }
+
+    pub fn create_buffer_with(
+        &self,
+        size: u64,
+        heap: D3D12_HEAP_TYPE,
+        state: D3D12_RESOURCE_STATES,
+        flags: D3D12_RESOURCE_FLAGS,
+    ) -> Result<ID3D12Resource> {
+        let desc = buffer_desc(size, flags);
         let mut res = None;
         // SAFETY: valid descriptors; out pointer is a local.
         unsafe {
