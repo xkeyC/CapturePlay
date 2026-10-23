@@ -6,14 +6,17 @@
 //! 2. asks the [`Pacer`] what is due,
 //! 3. builds that slot (real frame or interpolation),
 //! 4. waits on the swapchain's waitable object as late as possible, draws
-//!    output + UI and presents.
+//!    output + UI and presents — on a variable-refresh display exactly at the
+//!    slot's target time, on a fixed-refresh one just before its vblank.
 
 use std::rc::Rc;
 use std::sync::Arc;
 
 use cp_core::VideoMode;
 use cp_core::cadence::{CadenceConfig, CadenceTracker};
-use cp_core::pacing::{FrameRef, Pacer, PacingConfig, Planned, Slot};
+use cp_core::pacing::{DelayEstimator, FrameRef, Pacer, PacingConfig, Planned, Refresh, Slot};
+use cp_core::retime::Retimer;
+use cp_core::settings::RefreshMode;
 use cp_core::time::HostTime;
 use windows::Win32::Foundation::HWND;
 use windows::Win32::Graphics::Direct3D12::*;
@@ -21,11 +24,13 @@ use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT;
 use windows::core::Result;
 
 use crate::arena::UploadArena;
+use crate::clock::PreciseSleep;
 use crate::convert::{ConvertPass, DecodeParams};
 use crate::descriptors::{GpuDescriptorRing, StagingHeap};
 use crate::egui_pass::{EguiFrame, EguiPass};
 use crate::gpu::{Gpu, transition};
 use crate::output::{OutputParams, OutputPass};
+use crate::present_timing::{PresentTiming, RefreshKind};
 use crate::presenter::{PresentResult, Presenter};
 use crate::texture::{Texture, TextureDesc};
 use crate::upload::UploadRing;
@@ -33,6 +38,10 @@ use crate::upload::UploadRing;
 const FRAMES_IN_FLIGHT: usize = 2;
 const WORKING_FORMAT: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT =
     DXGI_FORMAT_R16G16B16A16_FLOAT;
+/// Minimum shrink of an excess content → display offset per unique frame
+/// (the excess otherwise decays by 1/32 per frame: transients such as a
+/// model load clear within a second or two, small wobbles stay smooth).
+const OFFSET_DECAY_NS: i64 = 50_000;
 /// Unique source frames kept on the GPU (pair being interpolated + spares).
 const FRAME_POOL: usize = 4;
 
@@ -46,6 +55,9 @@ pub struct RenderConfig {
     pub sdr_white_override: Option<f32>,
     pub peak_override: Option<f32>,
     pub pacing: PacingConfig,
+    pub refresh: RefreshMode,
+    /// Reconstruct even content timing (see [`cp_core::retime`]).
+    pub retime: bool,
 }
 
 impl Default for RenderConfig {
@@ -57,6 +69,8 @@ impl Default for RenderConfig {
             sdr_white_override: None,
             peak_override: None,
             pacing: PacingConfig::default(),
+            refresh: RefreshMode::Auto,
+            retime: true,
         }
     }
 }
@@ -103,6 +117,9 @@ pub trait Enhancer {
     ) -> Result<()>;
 }
 
+/// Wakes the render thread (from capture or worker threads).
+pub type Wake = Arc<dyn Fn() + Send + Sync>;
+
 /// Upscaling backend: source-resolution working frame → larger working
 /// frame, once per unique frame (before interpolation, which then runs at
 /// the upscaled size). When none is active, the output pass scales.
@@ -122,7 +139,14 @@ pub trait Upscaler {
         src: (u32, u32),
         dst: (u32, u32),
     ) -> bool;
-    fn upscale(&mut self, ctx: &mut RecordCtx<'_>, src: &Texture, out: &Texture) -> Result<()>;
+    /// Starts upscaling `src` (source size): records and submits what is
+    /// needed, continues in the background and calls `wake` when the result
+    /// can be collected. One frame is in flight at a time.
+    fn begin(&mut self, ctx: &mut RecordCtx<'_>, src: &Texture, wake: &Wake) -> Result<()>;
+    /// Records the transfer of the last result into `out` (target size)
+    /// and returns `true`; `false` while still running (only when
+    /// `!block`).
+    fn finish(&mut self, ctx: &mut RecordCtx<'_>, out: &Texture, block: bool) -> Result<bool>;
 }
 
 /// Display-driven target changes (window resize) apply after this long, so
@@ -234,6 +258,25 @@ struct FrameCtx {
     pending_free: Vec<egui::TextureId>,
 }
 
+/// A converted unique frame on its way to the pacer.
+#[derive(Clone, Copy)]
+struct NewFrame {
+    id: u64,
+    pi: usize,
+    info: cp_core::cadence::CadenceInfo,
+    /// Capture time (host clock).
+    observed_ns: i64,
+    signal_ns: i64,
+    arrival: HostTime,
+}
+
+/// A frame whose upscale is still running.
+struct PendingFrame {
+    pi: usize,
+    sizes: ((u32, u32), (u32, u32)),
+    frame: NewFrame,
+}
+
 struct PooledFrame {
     id: Option<u64>,
     tex: Texture,
@@ -259,6 +302,12 @@ pub struct RenderStats {
     /// Time of the last upscale (ms).
     pub upscale_ms: f64,
     pub multiplier: u32,
+    /// Spread of actual vs. scheduled display times (ms, p95).
+    pub present_jitter_ms: Option<f64>,
+    /// Detected display behaviour.
+    pub refresh_kind: RefreshKind,
+    /// The schedule assumes a variable-refresh display.
+    pub vrr_timing: bool,
 }
 
 pub struct Renderer {
@@ -281,6 +330,9 @@ pub struct Renderer {
     upscale_target: UpscaleTarget,
     /// Working size actually used for the last frame.
     upscale_effective: Option<(u32, u32)>,
+    /// Frame whose upscale is running on the backend's worker.
+    pending: Option<PendingFrame>,
+    wake: Wake,
     /// Next enhanced frame must reset temporal history.
     enhance_reset: bool,
     shown: Option<Slot>,
@@ -290,6 +342,15 @@ pub struct Renderer {
     heap: Rc<StagingHeap>,
     cadence: CadenceTracker,
     pacer: Pacer,
+    retimer: Retimer,
+    /// Capture time → ready-to-show budget.
+    delay: DelayEstimator,
+    /// Content time of the previous unique frame.
+    last_content_ns: Option<i64>,
+    /// Smoothed content → display time offset.
+    offset_ns: Option<i64>,
+    timing: PresentTiming,
+    sleep: PreciseSleep,
     config: RenderConfig,
     stats: RenderStats,
     /// Arrival time of each pooled frame id, for latency stats.
@@ -350,7 +411,11 @@ impl Renderer {
             l
         };
         let presenter = Presenter::new(&gpu, hwnd, size.0, size.1)?;
-        let upload = UploadRing::new(gpu.device.clone(), gpu.fence.clone(), wake);
+        let wake: Wake = Arc::new(wake);
+        let upload = {
+            let w = wake.clone();
+            UploadRing::new(gpu.device.clone(), gpu.fence.clone(), move || w())
+        };
         Ok(Self {
             timer: crate::gpu_timer::GpuTimer::new(&gpu, FRAMES_IN_FLIGHT)?,
             convert: ConvertPass::new(&gpu)?,
@@ -368,6 +433,8 @@ impl Renderer {
             upscale_src: None,
             upscale_target: UpscaleTarget::default(),
             upscale_effective: None,
+            pending: None,
+            wake,
             enhance_reset: true,
             shown: None,
             upload,
@@ -376,6 +443,12 @@ impl Renderer {
             heap,
             cadence: CadenceTracker::new(CadenceConfig::default()),
             pacer: Pacer::new(config.pacing),
+            retimer: Retimer::default(),
+            delay: DelayEstimator::default(),
+            last_content_ns: None,
+            offset_ns: None,
+            timing: PresentTiming::default(),
+            sleep: PreciseSleep::new()?,
             config,
             stats: RenderStats::default(),
             arrivals: Vec::new(),
@@ -408,6 +481,13 @@ impl Renderer {
         if config.pacing != self.config.pacing {
             self.pacer.set_config(config.pacing);
         }
+        if config.refresh != self.config.refresh {
+            self.timing.reset();
+            self.pacer.reset();
+        }
+        if config.retime != self.config.retime {
+            self.reset_timeline();
+        }
         self.config = config;
     }
 
@@ -429,6 +509,9 @@ impl Renderer {
 
     pub fn set_upscaler(&mut self, upscaler: Option<Box<dyn Upscaler>>) {
         let _ = self.gpu.wait_idle();
+        if let Some(p) = self.pending.take() {
+            self.pool[p.pi].id = None;
+        }
         self.upscaler = upscaler;
         self.upscale_target = UpscaleTarget::default();
         self.stats.upscale = None;
@@ -465,9 +548,9 @@ impl Renderer {
         self.enhancer.as_ref().map(|e| e.name())
     }
 
-    /// Upscales `upscale_src` into pool texture `pi`. On failure the backend
-    /// is dropped and `false` returned.
-    fn run_upscaler(&mut self, pi: usize) -> bool {
+    /// Starts upscaling `upscale_src` for pool texture `pi`. On failure the
+    /// backend is dropped and `false` returned.
+    fn begin_upscale(&mut self) -> bool {
         let (Some(mut up), Some(src)) = (self.upscaler.take(), self.upscale_src.as_ref()) else {
             return false;
         };
@@ -479,11 +562,8 @@ impl Renderer {
             list: &self.list,
             allocator: &f.allocator,
         };
-        match up.upscale(&mut ctx, src, &self.pool[pi].tex) {
+        match up.begin(&mut ctx, src, &self.wake) {
             Ok(()) => {
-                let ms = up.last_ms();
-                let s = &mut self.stats.upscale_ms;
-                *s = if *s == 0.0 { ms } else { *s * 0.9 + ms * 0.1 };
                 self.upscaler = Some(up);
                 true
             }
@@ -493,6 +573,106 @@ impl Renderer {
                 self.stats.upscale = None;
                 false
             }
+        }
+    }
+
+    /// Collects the pending upscale (waiting for it when `block`) and
+    /// schedules its frame.
+    fn complete_upscale(&mut self, block: bool, refresh: Refresh) {
+        let Some(pi) = self.pending.as_ref().map(|p| p.pi) else {
+            return;
+        };
+        let Some(mut up) = self.upscaler.take() else {
+            self.pending = None;
+            self.pool[pi].id = None;
+            return;
+        };
+        let f = &self.frames[self.frame_index];
+        let mut ctx = RecordCtx {
+            gpu: &self.gpu,
+            heap: &self.heap,
+            ring: &mut self.ring,
+            list: &self.list,
+            allocator: &f.allocator,
+        };
+        match up.finish(&mut ctx, &self.pool[pi].tex, block) {
+            Ok(false) => self.upscaler = Some(up),
+            Ok(true) => {
+                let ms = up.last_ms();
+                let s = &mut self.stats.upscale_ms;
+                *s = if *s == 0.0 { ms } else { *s * 0.9 + ms * 0.1 };
+                self.upscaler = Some(up);
+                if let Some(p) = self.pending.take() {
+                    self.stats.upscale = Some(p.sizes);
+                    self.schedule_frame(&p.frame, refresh);
+                }
+            }
+            Err(e) => {
+                tracing::error!("upscaler {} failed, disabling it: {e}", up.name());
+                self.upscale_target = UpscaleTarget::default();
+                self.stats.upscale = None;
+                self.pending = None;
+                self.pool[pi].id = None;
+            }
+        }
+    }
+
+    /// Enhances a finished working frame and hands it to the pacer.
+    fn schedule_frame(&mut self, f: &NewFrame, refresh: Refresh) {
+        let NewFrame {
+            id,
+            pi,
+            info,
+            observed_ns,
+            signal_ns,
+            arrival,
+        } = *f;
+        // Long gaps (menus, stalls) break temporal history too.
+        let gap = info
+            .interval_ns
+            .is_some_and(|iv| info.content_interval_ns.is_some_and(|c| iv > c * 4));
+        let reset = std::mem::take(&mut self.enhance_reset) || gap;
+        self.run_enhancer(pi, id, reset);
+        self.stats.unique += 1;
+        if let Some(iv) = info.content_interval_ns {
+            self.stats.content_fps = 1e9 / iv as f64;
+        }
+        self.arrivals.push((id, arrival));
+        if self.arrivals.len() > 16 {
+            self.arrivals.remove(0);
+        }
+        // Schedule on the (reconstructed) capture clock: the first slot
+        // appears one processing budget after the content time, so arrival
+        // and processing jitter never reach the screen.
+        let content_ns = if self.config.retime {
+            self.retimer.push(observed_ns, signal_ns)
+        } else {
+            observed_ns
+        };
+        let ready = HostTime::now().0;
+        self.delay.push(ready - content_ns);
+        let budget = self.delay.estimate().unwrap_or(ready - content_ns);
+        // Content → display offset. Rises at once when frames need longer
+        // (never show late), decays slowly: a jumpy offset would make the
+        // gap between consecutive pairs uneven.
+        let needed = budget + self.lead_ns();
+        let offset = match self.offset_ns {
+            Some(o) if o > needed => o - ((o - needed) / 32).max(OFFSET_DECAY_NS).min(o - needed),
+            _ => needed,
+        };
+        self.offset_ns = Some(offset);
+        let base = (content_ns + offset).max(ready + self.lead_ns());
+        self.pacer.on_unique_frame(
+            FrameRef {
+                id,
+                time_ns: content_ns,
+            },
+            base,
+            refresh,
+            info.content_interval_ns,
+        );
+        if let Some(prev) = self.last_content_ns.replace(content_ns) {
+            self.stats.multiplier = self.pacer.multiplier(content_ns - prev, refresh);
         }
     }
 
@@ -521,10 +701,21 @@ impl Renderer {
         }
     }
 
+    fn reset_timeline(&mut self) {
+        self.pacer.reset();
+        self.retimer.reset();
+        self.delay.reset();
+        self.last_content_ns = None;
+        self.offset_ns = None;
+    }
+
     /// Forget all frames (source changed).
     pub fn reset_source(&mut self) {
+        if let Some(p) = self.pending.take() {
+            self.pool[p.pi].id = None;
+        }
         self.cadence.reset();
-        self.pacer.reset();
+        self.reset_timeline();
         self.shown = None;
         self.enhance_reset = true;
         for p in &mut self.pool {
@@ -538,11 +729,48 @@ impl Renderer {
 
     pub fn invalidate_display(&mut self) {
         self.presenter.display.invalidate();
+        // Fullscreen/monitor changes can switch VRR and the flip model.
+        self.timing.reset();
     }
 
-    /// Next time (ns) the render loop should wake for a scheduled slot.
+    /// Next time (ns) the render loop should wake for a scheduled slot:
+    /// early enough to compose it before its present time.
     pub fn next_deadline(&self) -> Option<i64> {
-        self.pacer.next_target()
+        let refresh = self.refresh();
+        self.pacer
+            .next_target()
+            .map(|t| t - self.lead_ns() - slack_ns(refresh))
+    }
+
+    /// Display timing model used for scheduling.
+    fn refresh(&self) -> Refresh {
+        let nominal = self.presenter.display.info().refresh_period_ns();
+        let fixed = match self.config.refresh {
+            RefreshMode::Auto => self.timing.kind() == RefreshKind::Fixed,
+            RefreshMode::Variable => false,
+            RefreshMode::Fixed => true,
+        };
+        match (fixed, self.timing.vblank_ns()) {
+            (true, Some(phase_ns)) => Refresh::Fixed {
+                period_ns: self.timing.period_ns(nominal),
+                phase_ns,
+            },
+            _ => Refresh::Variable {
+                min_period_ns: nominal,
+            },
+        }
+    }
+
+    /// Time ingesting one unique frame keeps the render thread busy
+    /// (conversion recording; upscaling runs on the backend's worker).
+    fn ingest_ns(&self) -> i64 {
+        1_500_000
+    }
+
+    /// Time from starting to compose a slot until it is ready to present.
+    fn lead_ns(&self) -> i64 {
+        let gpu = (self.stats.interp_gpu_ms * 1e6) as i64;
+        (gpu + 1_500_000).clamp(2_000_000, 10_000_000)
     }
 
     fn decode_params(&self) -> DecodeParams {
@@ -641,11 +869,13 @@ impl Renderer {
     }
 
     fn shown_ids(&self) -> Vec<u64> {
-        match self.shown {
+        let mut ids = match self.shown {
             Some(Slot::Real { id }) => vec![id],
             Some(Slot::Interp { prev, next, .. }) => vec![prev, next],
             None => vec![],
-        }
+        };
+        ids.extend(self.pending.as_ref().map(|p| p.frame.id));
+        ids
     }
 
     fn begin_frame(&mut self) -> Result<()> {
@@ -676,14 +906,24 @@ impl Renderer {
     pub fn step(&mut self, ui: Option<EguiFrame<'_>>, force: bool) -> Result<PresentResult> {
         if self.presenter.display.update(self.presenter.hwnd()) {
             tracing::info!(display = ?self.presenter.display.info(), "output mapping updated");
+            self.timing.reset();
         }
-        self.begin_frame()?;
-        let now = HostTime::now();
-        let period = self.presenter.display.info().refresh_period_ns();
+        let nominal = self.presenter.display.info().refresh_period_ns();
+        if let Some(s) = self.presenter.frame_stats() {
+            let before = self.timing.kind();
+            self.timing.on_stats(s, nominal);
+            if self.timing.kind() != before {
+                tracing::info!(kind = ?self.timing.kind(), "display refresh detected");
+            }
+        }
+        self.stats.present_jitter_ms = self.timing.jitter_ms();
+        self.stats.refresh_kind = self.timing.kind();
+        let refresh = self.refresh();
+        self.stats.vrr_timing = matches!(refresh, Refresh::Variable { .. });
 
-        // 1. Ingest (frozen: drop new frames, keep the picture).
-        let mut converted_slots = Vec::new();
+        // Frozen: drop new frames, keep the picture.
         if self.freeze == Freeze::Frozen {
+            self.begin_frame()?;
             for f in self.upload.take_ready() {
                 self.upload.release(f.slot, 0);
             }
@@ -691,16 +931,45 @@ impl Renderer {
                 self.finish()?;
                 return Ok(PresentResult::Ok);
             }
-            return self.compose_and_present(self.shown, ui);
+            return self.compose_and_present(self.shown, ui, None);
         }
-        for f in self.upload.take_ready() {
+
+        // 0. A slot that falls due before ingest could finish is presented
+        // first.
+        let ready_frames = self.upload.take_ready();
+        let mut ui = ui;
+        let no_texture_updates = egui::TexturesDelta::default();
+        if !ready_frames.is_empty() {
+            let horizon = HostTime::now().0 + self.lead_ns() + slack_ns(refresh) + self.ingest_ns();
+            if let Some(p) = self.pacer.take_due(horizon) {
+                self.begin_frame()?;
+                let r = self.compose_and_present(Some(p.slot), ui, Some(p.target_ns))?;
+                if r == PresentResult::DeviceLost {
+                    for f in ready_frames {
+                        self.upload.release(f.slot, 0);
+                    }
+                    return Ok(r);
+                }
+                // Textures were uploaded with that frame.
+                ui = ui.map(|u| EguiFrame {
+                    textures_delta: &no_texture_updates,
+                    ..u
+                });
+            }
+        }
+
+        // 1. Ingest: collect a finished upscale, then convert new frames.
+        self.begin_frame()?;
+        self.complete_upscale(false, refresh);
+        let mut converted_slots = Vec::new();
+        for f in ready_frames {
             self.stats.captured += 1;
             self.stats.mode = Some(f.meta.mode);
             self.stats.color = Some(f.meta.color);
-            let signal_iv = f.meta.mode.fps.frame_duration_hns() * 100;
+            let signal_ns = f.meta.mode.fps.frame_duration_hns() * 100;
             let info = self
                 .cadence
-                .push(f.meta.signature.clone(), f.meta.device_time.0, signal_iv);
+                .push(f.meta.signature.clone(), f.meta.device_time.0, signal_ns);
             if !info.unique {
                 self.upload.release(f.slot, 0);
                 continue;
@@ -709,6 +978,9 @@ impl Renderer {
                 self.upload.release(f.slot, 0);
                 continue;
             };
+            // One upscale in flight: the previous one owns the backend's
+            // buffers and its pool texture.
+            self.complete_upscale(true, refresh);
             let src = (f.meta.mode.width, f.meta.mode.height);
             let target = self.working_size(src);
             let pi = self.pool_texture(target.unwrap_or(src))?;
@@ -745,53 +1017,44 @@ impl Renderer {
                 convert_dst,
             )?;
             converted_slots.push(f.slot);
-            if let Some(dst) = target {
-                if !self.run_upscaler(pi) {
-                    // Frame is lost; later frames take the output-pass path.
-                    self.pool[pi].id = None;
-                    continue;
+            let frame = NewFrame {
+                id,
+                pi,
+                info,
+                observed_ns: f.meta.device_time.0,
+                signal_ns,
+                arrival: f.meta.arrival,
+            };
+            match target {
+                Some(dst) => {
+                    if self.begin_upscale() {
+                        self.pending = Some(PendingFrame {
+                            pi,
+                            sizes: (src, dst),
+                            frame,
+                        });
+                    } else {
+                        // Frame is lost; later frames take the output-pass path.
+                        self.pool[pi].id = None;
+                    }
                 }
-                self.stats.upscale = Some((src, dst));
-            } else {
-                self.stats.upscale = None;
-            }
-            // Long gaps (menus, stalls) break temporal history too.
-            let gap = info
-                .interval_ns
-                .is_some_and(|iv| info.content_interval_ns.is_some_and(|c| iv > c * 4));
-            let reset = std::mem::take(&mut self.enhance_reset) || gap;
-            self.run_enhancer(pi, id, reset);
-            self.stats.unique += 1;
-            if let Some(iv) = info.content_interval_ns {
-                self.stats.content_fps = 1e9 / iv as f64;
-            }
-            self.arrivals.push((id, f.meta.arrival));
-            if self.arrivals.len() > 16 {
-                self.arrivals.remove(0);
-            }
-            self.pacer.on_unique_frame(
-                FrameRef {
-                    id,
-                    time_ns: f.meta.device_time.0,
-                },
-                now.0,
-                period,
-                info.content_interval_ns,
-            );
-            if let Some(iv) = info.interval_ns {
-                self.stats.multiplier = self.pacer.multiplier(iv, period);
+                None => {
+                    self.stats.upscale = None;
+                    self.schedule_frame(&frame, refresh);
+                }
             }
         }
 
-        // 2. What is due? Present slightly ahead of the target: the
-        // waitable below aligns us to the next vblank anyway.
-        let due: Option<Planned> = self.pacer.take_due(now.0 + period / 2);
+        // 2. What is due? Anything whose present time falls within the
+        // compose lead (plus a little wake-up tolerance).
+        let horizon = HostTime::now().0 + self.lead_ns() + slack_ns(refresh) + 500_000;
+        let due: Option<Planned> = self.pacer.take_due(horizon);
         let slot = due
             .map(|p| p.slot)
             .or(if force { self.shown } else { None });
 
         let result = if slot.is_some() || force {
-            self.compose_and_present(slot, ui)?
+            self.compose_and_present(slot, ui, due.map(|p| p.target_ns))?
         } else {
             // Nothing to show: still submit conversions.
             self.finish()?;
@@ -804,11 +1067,13 @@ impl Renderer {
         Ok(result)
     }
 
-    /// Builds `slot` (or black when `None`), draws the UI and presents.
+    /// Builds `slot` (or black when `None`), draws the UI and presents — at
+    /// `target_ns` when the slot is scheduled, otherwise right away.
     fn compose_and_present(
         &mut self,
         slot: Option<Slot>,
         ui: Option<EguiFrame<'_>>,
+        target_ns: Option<i64>,
     ) -> Result<PresentResult> {
         // Resolve the slot into a texture.
         let src_is_interp = match slot {
@@ -819,16 +1084,19 @@ impl Renderer {
                 self.timer.end(&self.list, self.frame_index);
                 if !ok {
                     // No backend: fall back to the newer real frame.
-                    return self.compose_and_present(Some(Slot::Real { id: next }), ui);
+                    return self.compose_and_present(Some(Slot::Real { id: next }), ui, target_ns);
                 }
                 true
             }
         };
-        if let Some(Slot::Real { id }) = slot
-            && let Some(&(_, arrival)) = self.arrivals.iter().find(|(i, _)| *i == id)
-        {
-            self.stats.latency_ms = (HostTime::now() - arrival) as f64 / 1e6;
-        }
+        let arrival = match slot {
+            Some(Slot::Real { id }) => self
+                .arrivals
+                .iter()
+                .find(|(i, _)| *i == id)
+                .map(|&(_, a)| a),
+            _ => None,
+        };
         if slot.is_some() {
             self.shown = slot;
         }
@@ -896,7 +1164,17 @@ impl Renderer {
             )])
         };
         self.finish()?;
+        if let Some(t) = target_ns {
+            self.sleep.until(t - slack_ns(self.refresh()));
+        }
         let r = self.presenter.present(self.config.vsync);
+        if let Some(t) = target_ns {
+            self.timing
+                .on_present(self.presenter.last_present_count(), t);
+        }
+        if let Some(a) = arrival {
+            self.stats.latency_ms = (HostTime::now() - a) as f64 / 1e6;
+        }
         self.stats.presented += 1;
         if src_is_interp {
             self.stats.interpolated += 1;
@@ -998,5 +1276,14 @@ impl Renderer {
 impl Drop for Renderer {
     fn drop(&mut self) {
         let _ = self.gpu.wait_idle();
+    }
+}
+
+/// How long before a fixed-refresh vblank to present (variable refresh:
+/// exactly on time).
+fn slack_ns(refresh: Refresh) -> i64 {
+    match refresh {
+        Refresh::Variable { .. } => 0,
+        Refresh::Fixed { period_ns, .. } => (period_ns / 4).min(1_000_000),
     }
 }

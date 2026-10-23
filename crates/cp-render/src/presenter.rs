@@ -12,6 +12,8 @@
 
 use std::rc::Rc;
 
+use cp_core::time::HostTime;
+
 use windows::Win32::Foundation::{DXGI_STATUS_OCCLUDED, HANDLE, HWND, WAIT_OBJECT_0};
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -22,6 +24,7 @@ use windows::core::{Interface, Result};
 use crate::descriptors::{CpuDescriptor, StagingHeap};
 use crate::display::DisplayTracker;
 use crate::gpu::Gpu;
+use crate::present_timing::FrameStats;
 
 pub const BACKBUFFER_FORMAT: DXGI_FORMAT = DXGI_FORMAT_R16G16B16A16_FLOAT;
 pub const OUTPUT_COLOR_SPACE: DXGI_COLOR_SPACE_TYPE = DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709;
@@ -252,11 +255,23 @@ impl Presenter {
         }
     }
 
-    /// Latest presentation statistics: `(present_count, sync_qpc)`.
-    pub fn frame_statistics(&self) -> Option<(u32, i64)> {
+    /// Statistics of the latest displayed present (`None` before the first
+    /// one or while DXGI reports a disjoint/unavailable state).
+    pub fn frame_stats(&self) -> Option<FrameStats> {
         let mut s = DXGI_FRAME_STATISTICS::default();
-        // SAFETY: valid out pointer.
+        // SAFETY: valid swapchain and out pointer.
         unsafe { self.swapchain.GetFrameStatistics(&mut s).ok()? };
-        Some((s.PresentCount, s.SyncQPCTime))
+        Some(FrameStats {
+            present_count: s.PresentCount,
+            present_refresh_count: s.PresentRefreshCount,
+            sync_refresh_count: s.SyncRefreshCount,
+            sync_ns: HostTime::from_qpc(s.SyncQPCTime).0,
+        })
+    }
+
+    /// Id of the most recent `Present` (matches `FrameStats::present_count`).
+    pub fn last_present_count(&self) -> u32 {
+        // SAFETY: valid swapchain.
+        unsafe { self.swapchain.GetLastPresentCount().unwrap_or(0) }
     }
 }

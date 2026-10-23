@@ -169,6 +169,8 @@ fn render_config(s: &Settings) -> RenderConfig {
             output_fps_cap: s.interpolation.output_fps_cap.map(f64::from),
             ..PacingConfig::default()
         },
+        refresh: s.display.refresh,
+        retime: s.interpolation.retime,
     }
 }
 
@@ -208,6 +210,9 @@ impl RateMeter {
                 .upscale
                 .map(|(a, b)| format!("{}x{}->{}x{} {:.2}ms", a.0, a.1, b.0, b.1, s.upscale_ms))
                 .unwrap_or_default(),
+            mult = s.multiplier,
+            jitter_ms = s.present_jitter_ms.map(|j| format!("{j:.2}")).unwrap_or_default(),
+            refresh = ?s.refresh_kind,
             "stats"
         );
     }
@@ -542,8 +547,7 @@ fn run(
                 .min(Duration::from_millis(250));
         }
         if let Some(deadline) = st.renderer.next_deadline() {
-            let half = st.renderer.display().refresh_period_ns() / 2;
-            let ns = (deadline - half - HostTime::now().0).max(0);
+            let ns = (deadline - HostTime::now().0).max(0);
             timeout = timeout.min(Duration::from_nanos(ns as u64));
         }
         if let Some(r) = st.retry_at {

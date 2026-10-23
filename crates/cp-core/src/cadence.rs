@@ -133,14 +133,14 @@ impl CadenceTracker {
         }
     }
 
-    /// Median of recent unique intervals.
+    /// Mean of recent unique intervals. Not the median: a 42 fps game on a
+    /// 60 Hz signal alternates 16.7 / 33.3 ms intervals, whose median would
+    /// read as 60 fps.
     pub fn content_interval(&self) -> Option<i64> {
         if self.intervals.len() < 3 {
             return None;
         }
-        let mut v: Vec<i64> = self.intervals.iter().copied().collect();
-        v.sort_unstable();
-        Some(v[v.len() / 2])
+        Some(self.intervals.iter().sum::<i64>() / self.intervals.len() as i64)
     }
 
     fn is_duplicate(&self, a: &FrameSignature, b: &FrameSignature) -> bool {

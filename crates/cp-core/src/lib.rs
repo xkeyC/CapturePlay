@@ -8,6 +8,7 @@ pub mod cadence;
 pub mod color;
 pub mod format;
 pub mod pacing;
+pub mod retime;
 pub mod scale;
 pub mod settings;
 pub mod time;

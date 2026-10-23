@@ -7,10 +7,11 @@
 use cp_capture::DeviceInfo;
 use cp_core::format::ModeRequest;
 use cp_core::settings::{
-    InterpolationBackend, Language, ScalingFilter, Settings, UpscaleBackend, VsrQualitySetting,
+    InterpolationBackend, Language, RefreshMode, ScalingFilter, Settings, UpscaleBackend,
+    VsrQualitySetting,
 };
 use cp_core::{ColorDesc, Range, TransferFunction, VideoMode};
-use cp_render::{DisplayInfo, RenderStats};
+use cp_render::{DisplayInfo, RefreshKind, RenderStats};
 
 use crate::i18n::{self, Strings};
 
@@ -106,6 +107,24 @@ fn status_label(t: &Strings, s: BackendStatus) -> String {
         BackendStatus::Running(name) => format!("{}: {name}", t.status_running),
         BackendStatus::Unavailable => t.status_unavailable.to_string(),
     }
+}
+
+/// Detected display timing, e.g. "Variable (VRR) · presented on time · jitter 0.12 ms".
+fn timing_label(t: &Strings, st: &RenderStats) -> String {
+    let kind = match st.refresh_kind {
+        RefreshKind::Unknown => t.refresh_detecting,
+        RefreshKind::Variable => t.refresh_variable,
+        RefreshKind::Fixed => t.refresh_fixed,
+    };
+    let schedule = if st.vrr_timing {
+        t.schedule_vrr
+    } else {
+        t.schedule_vblank
+    };
+    let jitter = st
+        .present_jitter_ms
+        .map_or_else(String::new, |j| format!(" · {} {j:.2} ms", t.stats_jitter));
+    format!("{kind}\n{schedule}{jitter}")
 }
 
 fn mode_key(m: &VideoMode) -> String {
@@ -251,6 +270,9 @@ pub fn draw(ctx: &egui::Context, s: &mut Settings, v: &UiView<'_>) -> Vec<Action
                             });
                         });
                     }
+                    row(ui, t.retime, Some(t.retime_hint), |ui| {
+                        changed |= ui.checkbox(&mut s.interpolation.retime, "").changed();
+                    });
                     row(ui, t.freeze, None, |ui| {
                         let mut frozen = v.frozen;
                         if ui.checkbox(&mut frozen, "").changed() {
@@ -339,6 +361,19 @@ pub fn draw(ctx: &egui::Context, s: &mut Settings, v: &UiView<'_>) -> Vec<Action
                     row(ui, t.vsync, Some(t.vsync_hint), |ui| {
                         changed |= ui.checkbox(&mut s.display.vsync, "").changed();
                     });
+                    let refresh_label = |m: RefreshMode| match m {
+                        RefreshMode::Auto => t.refresh_auto,
+                        RefreshMode::Variable => t.refresh_variable,
+                        RefreshMode::Fixed => t.refresh_fixed,
+                    };
+                    row(ui, t.refresh_mode, Some(t.refresh_hint), |ui| {
+                        egui::ComboBox::from_id_salt("refresh_mode").selected_text(refresh_label(s.display.refresh)).show_ui(ui, |ui| {
+                            for m in [RefreshMode::Auto, RefreshMode::Variable, RefreshMode::Fixed] {
+                                changed |= ui.selectable_value(&mut s.display.refresh, m, refresh_label(m)).changed();
+                            }
+                        });
+                    });
+                    row(ui, t.status, None, |ui| ui.label(timing_label(t, v.stats)));
                     let filter_label = |f: ScalingFilter| match f {
                         ScalingFilter::Bilinear => t.filter_bilinear,
                         ScalingFilter::CatmullRom => t.filter_catmull,
@@ -379,7 +414,7 @@ pub fn draw(ctx: &egui::Context, s: &mut Settings, v: &UiView<'_>) -> Vec<Action
             let st = v.stats;
             let r = v.rates;
             ui.monospace(format!(
-                "{} {:5.1} fps  {} {:5.1} fps ({} {:4.1})\n{} {:5.1} fps  {} {:5.1} fps  ×{}\n{} {:5.2} ms\n{} {:5.1} ms\nGPU: {}",
+                "{} {:5.1} fps  {} {:5.1} fps ({} {:4.1})\n{} {:5.1} fps  {} {:5.1} fps  ×{}\n{} {:5.2} ms\n{} {:5.1} ms  {} {}\nGPU: {}",
                 t.stats_capture,
                 r.capture_fps,
                 t.stats_unique,
@@ -395,6 +430,8 @@ pub fn draw(ctx: &egui::Context, s: &mut Settings, v: &UiView<'_>) -> Vec<Action
                 st.interp_gpu_ms,
                 t.stats_latency,
                 st.latency_ms,
+                t.stats_jitter,
+                st.present_jitter_ms.map_or_else(|| "—".to_string(), |j| format!("{j:.2} ms")),
                 v.adapter
             ));
         });

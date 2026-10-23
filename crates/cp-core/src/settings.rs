@@ -96,6 +96,9 @@ pub struct InterpolationSettings {
     pub max_multiplier: u32,
     /// VFG model: 0 low, 1 medium, 2 high.
     pub vfg_quality: u32,
+    /// Reconstruct even content timing from the fixed-rate signal (smooths
+    /// variable frame rate games; locked frame rates are unaffected).
+    pub retime: bool,
     /// Directory with the NVIDIA Video Effects runtime (VFG). `None` =
     /// `$CAPTUREPLAY_VFX_RUNTIME`, then `runtime/nvidia-vfx` next to the exe.
     #[serde(alias = "vfg_runtime_dir")]
@@ -111,6 +114,7 @@ impl Default for InterpolationSettings {
             output_fps_cap: None,
             max_multiplier: 2,
             vfg_quality: 1,
+            retime: true,
             vfx_runtime_dir: None,
         }
     }
@@ -173,6 +177,21 @@ pub struct DisplaySettings {
     pub start_fullscreen: bool,
     /// Integer/aspect scaling filter.
     pub scaling: ScalingFilter,
+    /// Variable or fixed refresh presentation.
+    pub refresh: RefreshMode,
+}
+
+/// How frames are timed on the display.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RefreshMode {
+    /// Detected from DXGI frame statistics.
+    #[default]
+    Auto,
+    /// G-SYNC / FreeSync / HDMI VRR: present exactly on time.
+    Variable,
+    /// Fixed refresh: align to vblanks, even multipliers only.
+    Fixed,
 }
 
 impl Default for DisplaySettings {
@@ -184,6 +203,7 @@ impl Default for DisplaySettings {
             vsync: true,
             start_fullscreen: false,
             scaling: ScalingFilter::default(),
+            refresh: RefreshMode::default(),
         }
     }
 }

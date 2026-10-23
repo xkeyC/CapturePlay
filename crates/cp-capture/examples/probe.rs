@@ -18,6 +18,23 @@ use cp_core::settings::ColorSettings;
 struct CpuSink {
     buf: Mutex<Vec<u8>>,
     cadence: Mutex<(CadenceTracker, u64, i64, i64)>,
+    /// Device timestamps of all frames and of unique frames.
+    times: Mutex<(Vec<i64>, Vec<i64>)>,
+}
+
+/// Histogram of successive differences, in 0.5 ms buckets.
+fn print_intervals(label: &str, times: &[i64]) {
+    let mut buckets = std::collections::BTreeMap::<i64, u32>::new();
+    for w in times.windows(2) {
+        *buckets
+            .entry(((w[1] - w[0]) as f64 / 500_000.0).round() as i64)
+            .or_default() += 1;
+    }
+    let total: u32 = buckets.values().sum();
+    println!("{label} intervals ({total}):");
+    for (b, n) in buckets {
+        println!("  {:6.1} ms  {n:5}", b as f64 * 0.5);
+    }
 }
 
 impl FrameSink for CpuSink {
@@ -48,9 +65,15 @@ impl FrameSink for CpuSink {
         if info.unique {
             g.1 += 1;
         }
+        if let Ok(mut t) = self.times.lock() {
+            t.0.push(meta.device_time.0);
+            if info.unique {
+                t.1.push(meta.device_time.0);
+            }
+        }
         let lat = meta.arrival - meta.device_time;
         g.2 = g.2.max(lat);
-        if meta.seq.is_multiple_of(60) {
+        if meta.seq.is_multiple_of(240) {
             g.3 = info.content_interval_ns.unwrap_or(0);
             println!(
                 "seq {:5} color {:?} content interval {:.2} ms",
@@ -78,8 +101,8 @@ fn main() -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("no device"))?;
     eprintln!("opening {}", dev.name);
     let modes = cp_capture::list_modes(&dev)?;
-    println!("{} modes, e.g.:", modes.len());
-    for m in modes.iter().filter(|m| m.height >= 1080).take(12) {
+    println!("{} modes (≥1080p):", modes.len());
+    for m in modes.iter().filter(|m| m.height >= 1080) {
         println!("  {m}");
     }
 
@@ -107,6 +130,7 @@ fn main() -> anyhow::Result<()> {
     let sink = Arc::new(CpuSink {
         buf: Mutex::new(Vec::new()),
         cadence: Mutex::new((CadenceTracker::new(CadenceConfig::default()), 0, 0, 0)),
+        times: Mutex::new((Vec::new(), Vec::new())),
     });
     let cfg = CaptureConfig {
         device: dev,
@@ -118,7 +142,11 @@ fn main() -> anyhow::Result<()> {
         CaptureEvent::Started { mode, color, .. } => println!("started {mode} {color:?}"),
         CaptureEvent::Stopped { error } => println!("stopped {error:?}"),
     })?;
-    std::thread::sleep(Duration::from_secs(4));
+    let secs = std::env::var("PROBE_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(4);
+    std::thread::sleep(Duration::from_secs(secs));
     let frames = session
         .stats()
         .frames
@@ -134,5 +162,8 @@ fn main() -> anyhow::Result<()> {
         g.1,
         g.2 as f64 / 1e6
     );
+    let t = sink.times.lock().expect("lock");
+    print_intervals("signal", &t.0);
+    print_intervals("unique", &t.1);
     Ok(())
 }

@@ -7,6 +7,7 @@
 //! swapchain, waitable, max latency 1).
 
 pub mod arena;
+pub mod clock;
 pub mod convert;
 pub mod descriptors;
 pub mod display;
@@ -15,6 +16,7 @@ pub mod gpu;
 pub mod gpu_timer;
 pub mod interp_vfg;
 pub mod output;
+pub mod present_timing;
 pub mod presenter;
 pub mod renderer;
 pub mod shaders;
@@ -30,6 +32,7 @@ mod upscale_bench;
 pub use display::DisplayInfo;
 pub use egui_pass::EguiFrame;
 pub use interp_vfg::VfgInterpolator;
+pub use present_timing::RefreshKind;
 pub use presenter::PresentResult;
 pub use renderer::{
     Enhancer, FrameInput, Interpolator, RecordCtx, RenderConfig, RenderStats, Renderer, Upscaler,

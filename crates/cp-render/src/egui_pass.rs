@@ -42,7 +42,7 @@ impl std::fmt::Debug for EguiPass {
 }
 
 /// Everything needed to draw one egui frame.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct EguiFrame<'a> {
     pub primitives: &'a [ClippedPrimitive],
     pub textures_delta: &'a TexturesDelta,
