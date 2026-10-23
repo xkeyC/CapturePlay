@@ -197,6 +197,23 @@ impl Harness {
         }
         self.gpu.wait_idle().expect("wait");
     }
+
+    /// Reopens the command list after `finish`.
+    pub fn reopen(&mut self) {
+        // SAFETY: the GPU is idle (finish waited).
+        unsafe {
+            self.allocator.Reset().expect("allocator reset");
+            self.list.Reset(&self.allocator, None).expect("list reset");
+            self.list
+                .SetDescriptorHeaps(&[Some(self.ring.heap().clone())]);
+        }
+    }
+
+    /// Records a plain buffer copy.
+    pub fn copy_buffer(&self, dst: &ID3D12Resource, src: &ID3D12Resource, bytes: u64) {
+        // SAFETY: both buffers hold at least `bytes`; buffers promote from COMMON.
+        unsafe { self.list.CopyBufferRegion(dst, 0, src, 0, bytes) };
+    }
 }
 
 pub struct Readback {

@@ -14,6 +14,7 @@ pub struct Settings {
     pub color: ColorSettings,
     pub interpolation: InterpolationSettings,
     pub enhance: EnhanceSettings,
+    pub upscale: UpscaleSettings,
     pub display: DisplaySettings,
     pub audio: AudioSettings,
 }
@@ -96,8 +97,9 @@ pub struct InterpolationSettings {
     /// VFG model: 0 low, 1 medium, 2 high.
     pub vfg_quality: u32,
     /// Directory with the NVIDIA Video Effects runtime (VFG). `None` =
-    /// `$CAPTUREPLAY_VFG_RUNTIME`, then `<exe dir>/runtime/nvidia-vfg`.
-    pub vfg_runtime_dir: Option<String>,
+    /// `$CAPTUREPLAY_VFX_RUNTIME`, then `runtime/nvidia-vfx` next to the exe.
+    #[serde(alias = "vfg_runtime_dir")]
+    pub vfx_runtime_dir: Option<String>,
 }
 
 impl Default for InterpolationSettings {
@@ -109,7 +111,7 @@ impl Default for InterpolationSettings {
             output_fps_cap: None,
             max_multiplier: 2,
             vfg_quality: 1,
-            vfg_runtime_dir: None,
+            vfx_runtime_dir: None,
         }
     }
 }
@@ -128,6 +130,34 @@ pub struct EnhanceSettings {
 pub enum EnhanceBackend {
     #[default]
     Off,
+}
+
+/// Upscaling of the captured frame to the display (e.g. 1440p HDR → 4K).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct UpscaleSettings {
+    pub backend: UpscaleBackend,
+    pub vsr_quality: VsrQualitySetting,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum UpscaleBackend {
+    /// Output pass only (perceptual-domain Catmull-Rom or bilinear).
+    Off,
+    /// NVIDIA RTX Video Super Resolution (Video Effects SDK), RTX 20+.
+    #[default]
+    NvidiaVsr,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum VsrQualitySetting {
+    Low,
+    #[default]
+    Medium,
+    High,
+    Ultra,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]

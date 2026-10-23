@@ -126,11 +126,54 @@ GPU 时间用时间戳查询测量，包含 CUDA 跨引擎部分。UI 提供 **�
 
 即使改为遮挡感知的前向投影，光流方案在边缘仍比 VFG 均衡低约 6 dB，GPU 耗时却相近，因此被移除。测试也定位并修复了它的一个崩溃：注册给 NVOFA 的资源在 `nvOFDestroy` 之后释放会访问冲突（运行中切换后端时闪退）。
 
-## 6. 音频
+## 6. 上采样调研：1440p HDR → 4K
+
+**背景**：本机采集卡（LGU 2.1）在 60 Hz 下支持 HDR（P010）的最高分辨率是 1440p，4K 显示需要上采样。采集画面没有游戏引擎提供的运动向量、深度和亚像素抖动。
+
+### 6.1 候选方案
+
+| 方案 | 类型 | 是否适合采集画面 | 集成/许可 |
+|---|---|---|---|
+| **NVIDIA VSR**（VFX SDK `VideoSuperRes`，即 RTX Video Super Resolution 模型 `nvngx_vsr.dll`） | AI 空间超分 + 压缩伪影修复 | ✅ 为视频设计，逐帧、无需运动向量 | 官方 VFX SDK 运行时，动态加载，与 VFG 共用 D3D12↔CUDA 桥 |
+| DLSS SR（Transformer） | 游戏时序超分 | ❌ 依赖引擎运动向量/深度/抖动；采集画面只能喂零或光流（光流在边界不可靠，见 5.2） | 需 NGX core 静态库或 Streamline，且不面向视频 |
+| FSR 1 / NIS | 传统空间超分 + 锐化 | ✅ | MIT 着色器，可作非 NVIDIA 备选 |
+| Catmull-Rom | 插值缩放 | ✅ | 已实现（改为 PQ 感知域，作为 VSR 备选） |
+
+### 6.2 真值测试（真实游戏画面）
+
+方法（`crates/cp-render/src/upscale_bench.rs`）：用采集卡抓取 PS5《战神：诸神黄昏》**原生 4K HDR** 帧（4K30 P010），在线性光下面积平均缩到 1440p，再由各方案放大回 4K，与原图在 **PQ 感知域**比较 PSNR；3 帧结果一致，下表为 frame_0。耗时为 RTX 4090 上 1440p→4K 单帧，`cuCtxSynchronize` 计时。
+
+| 方案 | PSNR | 耗时 |
+|---|---|---|
+| 双线性（线性光） | 30.77 dB | — |
+| Catmull-Rom（当前，线性光） | 31.49 dB | ~0.1 ms |
+| Lanczos3（线性光） | 31.27 dB | — |
+| VSR Bicubic（非 AI，PQ 域） | 32.69 dB | 0.43 ms |
+| VSR Low / Medium | 32.64 / 32.53 dB | 1.47 / 1.72 ms |
+| **VSR High** | **32.88 dB** | 4.42 ms |
+| VSR Ultra | 32.59 dB | 4.88 ms |
+| VSR HighBitrate High / Ultra | 32.11 / 32.19 dB | 4.78 / 6.75 ms |
+| VSR Streaming Medium / Ultra | 31.22 / 30.30 dB | 2.46 / 8.39 ms |
+
+结论：
+1. **10-bit 输入应使用 PQ 编码**：同样的模型喂“0–1000 nit 的 sRGB 曲线”编码，各档低 1–3 dB。
+2. VSR High 比当前 Catmull-Rom 高约 1.4 dB，视觉上叶脉、苔藓等高频细节明显更清晰；Ultra / HighBitrate / Streaming 档在这类干净的游戏画面上没有收益。
+3. PSNR 增益的相当一部分来自“在感知域（PQ）而非线性光中插值”（VSR Bicubic 已 +1.2 dB）。这对现有 Catmull-Rom 也是一个零成本的改进方向。
+4. **同步陷阱**：VSR 在 SDK 内部的 CUDA 流上执行，挂在我们流上的完成 fence 在 0.70 ms 就触发，实际计算到 3.90 ms 才结束（测试 `vsr_completion_fence_is_not_stream_ordered`）。集成时不能依赖流顺序，需在工作线程上等待计算完成后再从 CPU 端 signal D3D12 fence。VFG 没有这个问题（fence 与实际完成同为 1.42 ms）。
+
+### 6.3 实现
+- 管线：采集 1440p → 转换 → **VSR（PQ 编码，默认 Medium）→ 4K** → VFG（4K，约 2.1 ms）→ 输出。每个唯一帧只做一次超分（30/s），补帧在 4K 上进行。
+- 目标尺寸：按显示区域选 VSR 支持的最小覆盖倍数（4/3、1.5、2、3、4×，`cp_core::scale`）；窗口尺寸变化 300 ms 去抖，画面不大于窗口时不超分。
+- 同步：编码 → CPU 等待 → CPU signal 生产者 fence → VSR → `cuCtxSynchronize` → 解码（见 6.2 第 4 点）。
+- 会话（模型）加载约 2 s，在后台线程进行；加载完成前由输出阶段缩放，不阻塞渲染。实测 1440p60 HDR → 4K 全屏：稳态 VSR **1.62 ms/帧**，启用瞬间有约 1 s 的轻微掉帧（首次运行初始化），可接受。
+- 备选：VSR 关闭或不可用时，输出阶段用 **PQ 感知域 Catmull-Rom**（+1.2 dB，对比线性光）。
+- DLSS SR 不采用；非 NVIDIA 显卡可加 FSR 1 作为备选。
+
+## 7. 音频
 
 采集卡 HDMI 音频是普通 WASAPI 采集端点，按产品名与视频设备自动配对；不会回退到无关输入（避免误播麦克风）。两条事件驱动线程（MMCSS Pro Audio）经无锁 SPSC 环形缓冲连接；输出端以采集格式初始化，交给 Windows 转换（`AUTOCONVERTPCM`）。两个设备时钟的漂移由 ±0.5% 的线性重采样吸收，比例由缓冲水位的慢速控制器决定（有仿真测试），延迟目标默认 30 ms，可调音画偏移。
 
-## 7. 采集卡建议（以 AVerMedia Live Gamer Ultra 2.1 为例）
+## 8. 采集卡建议（以 AVerMedia Live Gamer Ultra 2.1 为例）
 
 | 模式 | 结论 |
 |---|---|
@@ -140,7 +183,7 @@ GPU 时间用时间戳查询测量，包含 CUDA 跨引擎部分。UI 提供 **�
 
 该卡（USB 版）不支持 AVerMedia 硬件色调映射属性集，HDR 直通无需设置；PCIe 型号会自动关闭硬件色调映射。
 
-## 8. 构建与运行
+## 9. 构建与运行
 
 需求：Windows 10/11 x64，Rust 1.95+（MSVC 工具链），Windows SDK（`dxc.exe`，构建时编译 HLSL 为签名 DXIL；可用 `DXC_PATH` 指定），D3D12 显卡；补帧需要 NVIDIA RTX 40/50 显卡与 VFG 运行时。
 
@@ -149,7 +192,7 @@ cargo build --release
 .\target\release\capture-play.exe
 ```
 
-可选 VFG 运行时放到 `runtime/nvidia-vfg/`（见 `runtime/README.md`）。
+可选 NVIDIA Video Effects 运行时（VFG、VSR）放到 `runtime/nvidia-vfx/`（见 `runtime/README.md`）。
 
 | 操作 | 快捷键 |
 |---|---|
@@ -162,7 +205,7 @@ cargo build --release
 
 设置保存在 `%APPDATA%\CapturePlay\settings.toml`，日志在同目录 `capture-play.log`（`CAPTUREPLAY_LOG=debug` 提高级别，`CAPTUREPLAY_D3D_DEBUG=1` 启用 D3D12 调试层）。UI 支持中文/英文，默认跟随系统语言。
 
-## 9. 相对参考项目（Veyra-NRVideo）的取舍
+## 10. 相对参考项目（Veyra-NRVideo）的取舍
 
 | 方面 | 参考项目 | 本项目 |
 |---|---|---|
@@ -174,19 +217,19 @@ cargo build --release
 | 补帧 | 多后端，含针对签名 DLL 的内存补丁/架构伪装 | 只用官方、可正常加载的运行时（NVIDIA VFG），画质用真值测试量化 |
 | DLSS 5 NR | 依赖未公开功能与对 NVIDIA 访问限制的规避 | 不实现；保留 `Enhancer` 接口等待官方 SDK |
 
-## 10. 已知限制与后续
+## 11. 已知限制与后续
 
 - 画质对比需在 HDR 显示器上主观评估；尚无客观指标（可用 60 fps 内容做“隔帧插值 vs 真实帧”的 PSNR/SSIM 评估）。
 - 端到端延迟（含采集卡与显示器）需要光电/高速相机测量；软件内只统计到达→呈现。
 - 尚未实现：设备热插拔通知（目前定时重试）、设备丢失后自动重建、HDR 元数据（InfoFrame）读取、音频设备选择 UI、CI。
 - 镜头切换检测：目前依赖空档判断，场景硬切会生成一帧混合帧。
 
-## 11. 许可证
+## 12. 许可证
 
 本项目以 **GPL-3.0-or-later** 发布，见 [LICENSE](LICENSE)。
 
 仓库**不包含**任何专有 SDK、头文件或运行时。运行时按需动态加载：
 - 随 NVIDIA 显卡驱动提供：`nvcuda.dll`（CUDA driver）。
-- 用户自行安装：NVIDIA Video Effects SDK 运行时（VFG），见 `runtime/README.md`，受 NVIDIA 许可约束。
+- 用户自行安装：NVIDIA Video Effects SDK 运行时（VFG、VSR），见 `runtime/README.md`，受 NVIDIA 许可约束。
 
 CUDA 的 FFI 声明依据 NVIDIA 公开的头文件与文档手写。分发捆绑专有运行时的二进制包前，请自行评估 GPL 兼容性（例如为这些运行时添加 GPLv3 第 7 节的附加许可）。

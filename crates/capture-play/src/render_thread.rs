@@ -138,22 +138,22 @@ pub fn spawn(
     })
 }
 
-/// Where the NVIDIA Video Effects (VFG) runtime DLLs are looked up.
-fn vfg_runtime_dir(s: &Settings) -> std::path::PathBuf {
-    if let Some(d) = &s.interpolation.vfg_runtime_dir {
+/// Where the NVIDIA Video Effects runtime DLLs (VFG, VSR) are looked up.
+fn vfx_runtime_dir(s: &Settings) -> std::path::PathBuf {
+    if let Some(d) = &s.interpolation.vfx_runtime_dir {
         return d.into();
     }
-    if let Some(d) = std::env::var_os("CAPTUREPLAY_VFG_RUNTIME") {
+    if let Some(d) = std::env::var_os("CAPTUREPLAY_VFX_RUNTIME") {
         return d.into();
     }
-    // `runtime/nvidia-vfg` next to the exe or in any parent (finds the
+    // `runtime/nvidia-vfx` next to the exe or in any parent (finds the
     // repository's `runtime/` from `target/release`).
     let exe = std::env::current_exe().unwrap_or_default();
     exe.ancestors()
         .skip(1)
-        .map(|d| d.join("runtime").join("nvidia-vfg"))
+        .map(|d| d.join("runtime").join("nvidia-vfx"))
         .find(|d| cp_nvidia::vfg::runtime_present(d))
-        .unwrap_or_else(|| exe.with_file_name("runtime").join("nvidia-vfg"))
+        .unwrap_or_else(|| exe.with_file_name("runtime").join("nvidia-vfx"))
 }
 
 fn render_config(s: &Settings) -> RenderConfig {
@@ -204,6 +204,10 @@ impl RateMeter {
             content = format!("{:.1}", s.content_fps),
             latency_ms = format!("{:.1}", s.latency_ms),
             interp_gpu_ms = format!("{:.2}", s.interp_gpu_ms),
+            upscale = s
+                .upscale
+                .map(|(a, b)| format!("{}x{}->{}x{} {:.2}ms", a.0, a.1, b.0, b.1, s.upscale_ms))
+                .unwrap_or_default(),
             "stats"
         );
     }
@@ -224,6 +228,7 @@ struct State {
     retry_at: Option<Instant>,
     proxy: EventLoopProxy<ToMain>,
     interp_backend: Option<(InterpolationBackend, u32)>,
+    upscale_backend: Option<cp_core::settings::UpscaleSettings>,
     audio: Option<cp_audio::AudioPassthrough>,
     audio_endpoint: Option<String>,
 }
@@ -331,7 +336,7 @@ impl State {
         let interp: Option<Box<dyn cp_render::Interpolator>> = match want {
             InterpolationBackend::Off => None,
             InterpolationBackend::NvidiaVfg => {
-                let dir = vfg_runtime_dir(&self.settings);
+                let dir = vfx_runtime_dir(&self.settings);
                 match cp_render::VfgInterpolator::new(
                     self.renderer.gpu(),
                     dir,
@@ -348,8 +353,43 @@ impl State {
         self.renderer.set_interpolator(interp);
     }
 
+    /// (Re)creates the upscaler when its settings changed.
+    fn apply_upscaler(&mut self) {
+        use cp_core::settings::{UpscaleBackend, VsrQualitySetting};
+        use cp_nvidia::vsr::VsrQuality;
+        let want = self.settings.upscale;
+        if self.upscale_backend == Some(want) {
+            return;
+        }
+        self.upscale_backend = Some(want);
+        let upscaler: Option<Box<dyn cp_render::Upscaler>> = match want.backend {
+            UpscaleBackend::Off => None,
+            UpscaleBackend::NvidiaVsr => {
+                let quality = match want.vsr_quality {
+                    VsrQualitySetting::Low => VsrQuality::Low,
+                    VsrQualitySetting::Medium => VsrQuality::Medium,
+                    VsrQualitySetting::High => VsrQuality::High,
+                    VsrQualitySetting::Ultra => VsrQuality::Ultra,
+                };
+                match cp_render::VsrUpscaler::new(
+                    self.renderer.gpu(),
+                    vfx_runtime_dir(&self.settings),
+                    quality,
+                ) {
+                    Ok(u) => Some(Box::new(u)),
+                    Err(e) => {
+                        tracing::warn!("VSR unavailable, using output-pass scaling: {e}");
+                        None
+                    }
+                }
+            }
+        };
+        self.renderer.set_upscaler(upscaler);
+    }
+
     fn apply_settings(&mut self) {
         self.apply_interpolator();
+        self.apply_upscaler();
         match (&self.audio, self.settings.audio.enabled) {
             (Some(a), true) => {
                 a.set_volume(self.settings.audio.volume);
@@ -466,10 +506,12 @@ fn run(
         retry_at: None,
         proxy,
         interp_backend: None,
+        upscale_backend: None,
         audio: None,
         audio_endpoint: None,
     };
     st.apply_interpolator();
+    st.apply_upscaler();
     st.start_capture();
 
     let mut overlay = true;
@@ -606,6 +648,11 @@ fn run(
                     rates: &meter.rates,
                     adapter: &adapter,
                     interp,
+                    upscale: match (st.settings.upscale.backend, st.renderer.upscaler_name()) {
+                        (cp_core::settings::UpscaleBackend::Off, _) => BackendStatus::Off,
+                        (_, Some(n)) => BackendStatus::Running(n),
+                        (_, None) => BackendStatus::Unavailable,
+                    },
                     frozen: st.renderer.frozen(),
                     audio: audio.as_ref(),
                 };

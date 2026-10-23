@@ -124,6 +124,7 @@ cuda_api! {
     cuStreamCreate = "cuStreamCreate": fn(*mut CUstream, u32);
     cuStreamDestroy = "cuStreamDestroy_v2": fn(CUstream);
     cuStreamSynchronize = "cuStreamSynchronize": fn(CUstream);
+    cuCtxSynchronize = "cuCtxSynchronize": fn();
     cuImportExternalMemory = "cuImportExternalMemory": fn(*mut CUexternalMemory, *const CUDA_EXTERNAL_MEMORY_HANDLE_DESC);
     cuExternalMemoryGetMappedBuffer = "cuExternalMemoryGetMappedBuffer": fn(*mut CUdeviceptr, CUexternalMemory, *const CUDA_EXTERNAL_MEMORY_BUFFER_DESC);
     cuDestroyExternalMemory = "cuDestroyExternalMemory": fn(CUexternalMemory);

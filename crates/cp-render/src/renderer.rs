@@ -103,6 +103,73 @@ pub trait Enhancer {
     ) -> Result<()>;
 }
 
+/// Upscaling backend: source-resolution working frame → larger working
+/// frame, once per unique frame (before interpolation, which then runs at
+/// the upscaled size). When none is active, the output pass scales.
+pub trait Upscaler {
+    fn name(&self) -> &'static str;
+    /// Supported scale factors, ascending.
+    fn factors(&self) -> &'static [f32];
+    /// Duration of the last upscale in ms.
+    fn last_ms(&self) -> f64;
+    /// Readies the backend for `src → dst` without blocking (model loads
+    /// happen in the background). Until it returns `true` the renderer keeps
+    /// using output-pass scaling.
+    fn prepare(
+        &mut self,
+        gpu: &Gpu,
+        heap: &Rc<StagingHeap>,
+        src: (u32, u32),
+        dst: (u32, u32),
+    ) -> bool;
+    fn upscale(&mut self, ctx: &mut RecordCtx<'_>, src: &Texture, out: &Texture) -> Result<()>;
+}
+
+/// Display-driven target changes (window resize) apply after this long, so
+/// a window drag does not rebuild the upscaler on every step.
+const UPSCALE_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// Debounced choice of the upscaled working size.
+#[derive(Debug, Default)]
+struct UpscaleTarget {
+    src: Option<(u32, u32)>,
+    current: Option<(u32, u32)>,
+    pending: Option<(Option<(u32, u32)>, std::time::Instant)>,
+}
+
+impl UpscaleTarget {
+    /// Returns the target to use now and whether it changed.
+    fn update(
+        &mut self,
+        src: (u32, u32),
+        desired: Option<(u32, u32)>,
+    ) -> (Option<(u32, u32)>, bool) {
+        let source_changed = self.src != Some(src);
+        if desired == self.current && !source_changed {
+            self.pending = None;
+            return (self.current, false);
+        }
+        let now = std::time::Instant::now();
+        let apply = source_changed
+            || match self.pending {
+                Some((p, since)) if p == desired => now - since >= UPSCALE_DEBOUNCE,
+                _ => {
+                    self.pending = Some((desired, now));
+                    false
+                }
+            };
+        if apply {
+            let changed = self.current != desired;
+            self.src = Some(src);
+            self.current = desired;
+            self.pending = None;
+            (desired, changed)
+        } else {
+            (self.current, false)
+        }
+    }
+}
+
 /// A unique source frame handed to an interpolator or enhancer.
 #[derive(Debug, Clone, Copy)]
 pub struct FrameInput<'a> {
@@ -187,6 +254,10 @@ pub struct RenderStats {
     /// GPU time to produce one interpolated frame (ms, smoothed), including
     /// optical-flow / CUDA work the queue waited for.
     pub interp_gpu_ms: f64,
+    /// Active upscaling `(source, target)` size.
+    pub upscale: Option<((u32, u32), (u32, u32))>,
+    /// Time of the last upscale (ms).
+    pub upscale_ms: f64,
     pub multiplier: u32,
 }
 
@@ -204,6 +275,12 @@ pub struct Renderer {
     interpolator: Option<Box<dyn Interpolator>>,
     freeze: Freeze,
     enhancer: Option<Box<dyn Enhancer>>,
+    upscaler: Option<Box<dyn Upscaler>>,
+    /// Source-resolution frame fed to the upscaler.
+    upscale_src: Option<Texture>,
+    upscale_target: UpscaleTarget,
+    /// Working size actually used for the last frame.
+    upscale_effective: Option<(u32, u32)>,
     /// Next enhanced frame must reset temporal history.
     enhance_reset: bool,
     shown: Option<Slot>,
@@ -287,6 +364,10 @@ impl Renderer {
             interpolator: None,
             freeze: Freeze::Off,
             enhancer: None,
+            upscaler: None,
+            upscale_src: None,
+            upscale_target: UpscaleTarget::default(),
+            upscale_effective: None,
             enhance_reset: true,
             shown: None,
             upload,
@@ -346,8 +427,73 @@ impl Renderer {
         self.enhance_reset = true;
     }
 
+    pub fn set_upscaler(&mut self, upscaler: Option<Box<dyn Upscaler>>) {
+        let _ = self.gpu.wait_idle();
+        self.upscaler = upscaler;
+        self.upscale_target = UpscaleTarget::default();
+        self.stats.upscale = None;
+    }
+
+    pub fn upscaler_name(&self) -> Option<&'static str> {
+        self.upscaler.as_ref().map(|u| u.name())
+    }
+
+    /// Working (possibly upscaled) size for a source frame.
+    fn working_size(&mut self, src: (u32, u32)) -> Option<(u32, u32)> {
+        let desired = self
+            .upscaler
+            .as_ref()
+            .and_then(|u| cp_core::scale::upscale_target(src, self.presenter.size(), u.factors()));
+        let (target, changed) = self.upscale_target.update(src, desired);
+        if changed {
+            tracing::info!(?src, ?target, "upscale target changed");
+        }
+        let ready = match (target, self.upscaler.as_mut()) {
+            (Some(dst), Some(up)) => up.prepare(&self.gpu, &self.heap, src, dst),
+            _ => false,
+        };
+        let effective = target.filter(|_| ready);
+        if effective != self.upscale_effective {
+            // Never interpolate between frames of different sizes.
+            self.pacer.reset();
+            self.upscale_effective = effective;
+        }
+        effective
+    }
+
     pub fn enhancer_name(&self) -> Option<&'static str> {
         self.enhancer.as_ref().map(|e| e.name())
+    }
+
+    /// Upscales `upscale_src` into pool texture `pi`. On failure the backend
+    /// is dropped and `false` returned.
+    fn run_upscaler(&mut self, pi: usize) -> bool {
+        let (Some(mut up), Some(src)) = (self.upscaler.take(), self.upscale_src.as_ref()) else {
+            return false;
+        };
+        let f = &self.frames[self.frame_index];
+        let mut ctx = RecordCtx {
+            gpu: &self.gpu,
+            heap: &self.heap,
+            ring: &mut self.ring,
+            list: &self.list,
+            allocator: &f.allocator,
+        };
+        match up.upscale(&mut ctx, src, &self.pool[pi].tex) {
+            Ok(()) => {
+                let ms = up.last_ms();
+                let s = &mut self.stats.upscale_ms;
+                *s = if *s == 0.0 { ms } else { *s * 0.9 + ms * 0.1 };
+                self.upscaler = Some(up);
+                true
+            }
+            Err(e) => {
+                tracing::error!("upscaler {} failed, disabling it: {e}", up.name());
+                self.upscale_target = UpscaleTarget::default();
+                self.stats.upscale = None;
+                false
+            }
+        }
     }
 
     fn run_enhancer(&mut self, pool_index: usize, id: u64, reset: bool) {
@@ -441,15 +587,16 @@ impl Renderer {
         }
     }
 
-    fn pool_texture(&mut self, mode: &VideoMode) -> Result<usize> {
+    fn pool_texture(&mut self, (width, height): (u32, u32)) -> Result<usize> {
         let retained: Vec<u64> = self.pacer.retained_ids().chain(self.shown_ids()).collect();
-        // Drop textures of the wrong size.
+        let size_ok = |t: &Texture| t.width == width && t.height == height;
+        // Drop textures of another size unless something still shows them.
         self.pool
-            .retain(|p| p.tex.width == mode.width && p.tex.height == mode.height);
+            .retain(|p| size_ok(&p.tex) || p.id.is_some_and(|id| retained.contains(&id)));
         if let Some(i) = self
             .pool
             .iter()
-            .position(|p| p.id.is_none_or(|id| !retained.contains(&id)))
+            .position(|p| size_ok(&p.tex) && p.id.is_none_or(|id| !retained.contains(&id)))
         {
             return Ok(i);
         }
@@ -457,18 +604,40 @@ impl Renderer {
             let tex = Texture::new(
                 &self.gpu,
                 &self.heap,
-                TextureDesc::new(mode.width, mode.height, WORKING_FORMAT).uav(),
+                TextureDesc::new(width, height, WORKING_FORMAT).uav(),
             )?;
             self.pool.push(PooledFrame { id: None, tex });
             return Ok(self.pool.len() - 1);
         }
-        // Everything retained (should not happen): reuse the oldest id.
-        Ok(self
+        // Everything retained (should not happen): reuse the oldest frame of
+        // the right size, or replace the oldest of any size.
+        let oldest = self
             .pool
             .iter()
             .enumerate()
+            .filter(|(_, p)| size_ok(&p.tex))
             .min_by_key(|(_, p)| p.id.unwrap_or(0))
-            .map_or(0, |(i, _)| i))
+            .map(|(i, _)| i);
+        match oldest {
+            Some(i) => Ok(i),
+            None => {
+                let i = self
+                    .pool
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, p)| p.id.unwrap_or(0))
+                    .map_or(0, |(i, _)| i);
+                self.pool[i] = PooledFrame {
+                    id: None,
+                    tex: Texture::new(
+                        &self.gpu,
+                        &self.heap,
+                        TextureDesc::new(width, height, WORKING_FORMAT).uav(),
+                    )?,
+                };
+                Ok(i)
+            }
+        }
     }
 
     fn shown_ids(&self) -> Vec<u64> {
@@ -540,11 +709,29 @@ impl Renderer {
                 self.upload.release(f.slot, 0);
                 continue;
             };
-            let pi = self.pool_texture(&f.meta.mode)?;
+            let src = (f.meta.mode.width, f.meta.mode.height);
+            let target = self.working_size(src);
+            let pi = self.pool_texture(target.unwrap_or(src))?;
             let id = self.next_id;
             self.next_id += 1;
             self.pool[pi].id = Some(id);
             let params = self.decode_params();
+            if target.is_some()
+                && self
+                    .upscale_src
+                    .as_ref()
+                    .is_none_or(|t| (t.width, t.height) != src)
+            {
+                self.upscale_src = Some(Texture::new(
+                    &self.gpu,
+                    &self.heap,
+                    TextureDesc::new(src.0, src.1, WORKING_FORMAT).uav(),
+                )?);
+            }
+            let convert_dst = match (target, self.upscale_src.as_ref()) {
+                (Some(_), Some(t)) => t,
+                _ => &self.pool[pi].tex,
+            };
             self.convert.record(
                 &self.gpu,
                 &self.heap,
@@ -555,9 +742,19 @@ impl Renderer {
                 &f.meta.mode,
                 &f.meta.color,
                 params,
-                &self.pool[pi].tex,
+                convert_dst,
             )?;
             converted_slots.push(f.slot);
+            if let Some(dst) = target {
+                if !self.run_upscaler(pi) {
+                    // Frame is lost; later frames take the output-pass path.
+                    self.pool[pi].id = None;
+                    continue;
+                }
+                self.stats.upscale = Some((src, dst));
+            } else {
+                self.stats.upscale = None;
+            }
             // Long gaps (menus, stalls) break temporal history too.
             let gap = info
                 .interval_ns

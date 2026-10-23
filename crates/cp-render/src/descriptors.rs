@@ -155,3 +155,47 @@ impl GpuDescriptorRing {
         }
     }
 }
+
+/// Raw (byte-address) SRV or UAV of a buffer holding `words` 32-bit words.
+pub fn raw_buffer_view(
+    device: &ID3D12Device,
+    heap: &StagingHeap,
+    resource: &ID3D12Resource,
+    words: u32,
+    uav: bool,
+) -> Result<CpuDescriptor> {
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_TYPELESS;
+    let d = heap.alloc().ok_or_else(windows::core::Error::empty)?;
+    // SAFETY: valid buffer and a descriptor slot from our heap.
+    unsafe {
+        if uav {
+            let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                Format: DXGI_FORMAT_R32_TYPELESS,
+                ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+                Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                    Buffer: D3D12_BUFFER_UAV {
+                        NumElements: words,
+                        Flags: D3D12_BUFFER_UAV_FLAG_RAW,
+                        ..Default::default()
+                    },
+                },
+            };
+            device.CreateUnorderedAccessView(resource, None, Some(&desc), d.handle);
+        } else {
+            let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                Format: DXGI_FORMAT_R32_TYPELESS,
+                ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+                Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                    Buffer: D3D12_BUFFER_SRV {
+                        NumElements: words,
+                        Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+                        ..Default::default()
+                    },
+                },
+            };
+            device.CreateShaderResourceView(resource, Some(&desc), d.handle);
+        }
+    }
+    Ok(d)
+}

@@ -20,15 +20,19 @@ pub mod renderer;
 pub mod shaders;
 pub mod texture;
 pub mod upload;
+pub mod upscale_vsr;
 
 #[cfg(test)]
 mod testutil;
+#[cfg(test)]
+mod upscale_bench;
 
 pub use display::DisplayInfo;
 pub use egui_pass::EguiFrame;
 pub use interp_vfg::VfgInterpolator;
 pub use presenter::PresentResult;
 pub use renderer::{
-    Enhancer, FrameInput, Interpolator, RecordCtx, RenderConfig, RenderStats, Renderer,
+    Enhancer, FrameInput, Interpolator, RecordCtx, RenderConfig, RenderStats, Renderer, Upscaler,
 };
 pub use texture::Texture;
+pub use upscale_vsr::VsrUpscaler;

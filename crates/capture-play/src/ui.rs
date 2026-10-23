@@ -6,7 +6,9 @@
 
 use cp_capture::DeviceInfo;
 use cp_core::format::ModeRequest;
-use cp_core::settings::{InterpolationBackend, Language, ScalingFilter, Settings};
+use cp_core::settings::{
+    InterpolationBackend, Language, ScalingFilter, Settings, UpscaleBackend, VsrQualitySetting,
+};
 use cp_core::{ColorDesc, Range, TransferFunction, VideoMode};
 use cp_render::{DisplayInfo, RenderStats};
 
@@ -43,6 +45,7 @@ pub struct UiView<'a> {
     pub rates: &'a Rates,
     pub adapter: &'a str,
     pub interp: BackendStatus,
+    pub upscale: BackendStatus,
     pub frozen: bool,
     pub audio: Option<&'a AudioView>,
 }
@@ -109,6 +112,27 @@ fn mode_key(m: &VideoMode) -> String {
     format!("{}x{} @ {} {}", m.width, m.height, m.fps, m.format)
 }
 
+/// Two-column settings grid: description on the left, control on the right.
+fn grid(id: &str) -> egui::Grid {
+    egui::Grid::new(id).num_columns(2).spacing([16.0, 6.0])
+}
+
+/// One grid row; `hint` (if any) shows when hovering the description.
+fn row<R>(
+    ui: &mut egui::Ui,
+    label: &str,
+    hint: Option<&str>,
+    add: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
+    let l = ui.label(label);
+    if let Some(h) = hint {
+        l.on_hover_text(h);
+    }
+    let r = add(ui);
+    ui.end_row();
+    r
+}
+
 #[allow(clippy::too_many_lines)]
 pub fn draw(ctx: &egui::Context, s: &mut Settings, v: &UiView<'_>) -> Vec<Action> {
     let t = i18n::resolve(s.ui.language);
@@ -117,7 +141,7 @@ pub fn draw(ctx: &egui::Context, s: &mut Settings, v: &UiView<'_>) -> Vec<Action
 
     egui::Window::new("CapturePlay")
         .default_pos([16.0, 16.0])
-        .default_width(360.0)
+        .default_width(380.0)
         .resizable(false)
         .frame(egui::Frame::window(&ctx.global_style()).fill(egui::Color32::from_black_alpha(245)))
         .show(ctx, |ui| {
@@ -125,33 +149,41 @@ pub fn draw(ctx: &egui::Context, s: &mut Settings, v: &UiView<'_>) -> Vec<Action
             ui.separator();
 
             egui::CollapsingHeader::new(t.source).default_open(true).show(ui, |ui| {
-                let cur_dev = s.capture.device.clone();
-                let dev_name = v.devices.iter().find(|d| Some(&d.symbolic_link) == cur_dev.as_ref()).map_or(t.device_auto, |d| d.name.as_str());
-                egui::ComboBox::from_label(t.device).selected_text(dev_name).width(230.0).show_ui(ui, |ui| {
-                    for d in v.devices {
-                        if ui.selectable_label(Some(&d.symbolic_link) == cur_dev.as_ref(), &d.name).clicked() {
-                            actions.push(Action::SelectDevice(d.symbolic_link.clone()));
-                        }
+                grid("source").show(ui, |ui| {
+                    let cur_dev = s.capture.device.clone();
+                    let dev_name = v.devices.iter().find(|d| Some(&d.symbolic_link) == cur_dev.as_ref()).map_or(t.device_auto, |d| d.name.as_str());
+                    row(ui, t.device, None, |ui| {
+                        egui::ComboBox::from_id_salt("device").selected_text(dev_name).width(230.0).show_ui(ui, |ui| {
+                            for d in v.devices {
+                                if ui.selectable_label(Some(&d.symbolic_link) == cur_dev.as_ref(), &d.name).clicked() {
+                                    actions.push(Action::SelectDevice(d.symbolic_link.clone()));
+                                }
+                            }
+                        });
+                    });
+                    let cur = v.current_mode.map_or_else(|| "—".to_string(), |m| mode_key(&m));
+                    row(ui, t.format, None, |ui| {
+                        egui::ComboBox::from_id_salt("format").selected_text(cur).width(230.0).height(400.0).show_ui(ui, |ui| {
+                            let mut modes: Vec<&VideoMode> = v.modes.iter().filter(|m| m.height >= 720).collect();
+                            modes.sort_by_key(|m| std::cmp::Reverse((m.height, m.width, m.fps.as_f64() as u32)));
+                            for m in modes {
+                                if ui.selectable_label(Some(*m) == v.current_mode, mode_key(m)).clicked() {
+                                    actions.push(Action::SelectMode(ModeRequest {
+                                        width: Some(m.width),
+                                        height: Some(m.height),
+                                        fps: Some(m.fps.as_f64().round() as u32),
+                                        format: Some(m.format),
+                                    }));
+                                }
+                            }
+                        });
+                    });
+                    if let Some(c) = v.color {
+                        row(ui, t.signal, None, |ui| {
+                            ui.label(format!("{} · {:?} · {:?} {}", transfer_label(t, Some(c.transfer)), c.primaries, c.range, t.range_suffix))
+                        });
                     }
                 });
-                let cur = v.current_mode.map_or_else(|| "—".to_string(), |m| mode_key(&m));
-                egui::ComboBox::from_label(t.format).selected_text(cur).width(230.0).height(400.0).show_ui(ui, |ui| {
-                    let mut modes: Vec<&VideoMode> = v.modes.iter().filter(|m| m.height >= 720).collect();
-                    modes.sort_by_key(|m| std::cmp::Reverse((m.height, m.width, m.fps.as_f64() as u32)));
-                    for m in modes {
-                        if ui.selectable_label(Some(*m) == v.current_mode, mode_key(m)).clicked() {
-                            actions.push(Action::SelectMode(ModeRequest {
-                                width: Some(m.width),
-                                height: Some(m.height),
-                                fps: Some(m.fps.as_f64().round() as u32),
-                                format: Some(m.format),
-                            }));
-                        }
-                    }
-                });
-                if let Some(c) = v.color {
-                    ui.label(format!("{}: {} · {:?} · {:?} {}", t.signal, transfer_label(t, Some(c.transfer)), c.primaries, c.range, t.range_suffix));
-                }
                 if let Some(e) = v.capture_error {
                     ui.colored_label(egui::Color32::LIGHT_RED, format!("{}: {e}", t.capture_error));
                 } else if v.devices.is_empty() {
@@ -163,59 +195,123 @@ pub fn draw(ctx: &egui::Context, s: &mut Settings, v: &UiView<'_>) -> Vec<Action
             });
 
             egui::CollapsingHeader::new(t.color).default_open(false).show(ui, |ui| {
-                egui::ComboBox::from_label(t.transfer).selected_text(transfer_label(t, s.color.transfer)).show_ui(ui, |ui| {
-                    for tf in [None, Some(TransferFunction::Pq), Some(TransferFunction::Hlg), Some(TransferFunction::Srgb), Some(TransferFunction::Gamma22), Some(TransferFunction::Bt1886)] {
-                        changed |= ui.selectable_value(&mut s.color.transfer, tf, transfer_label(t, tf)).changed();
-                    }
+                grid("color").show(ui, |ui| {
+                    row(ui, t.transfer, None, |ui| {
+                        egui::ComboBox::from_id_salt("transfer").selected_text(transfer_label(t, s.color.transfer)).show_ui(ui, |ui| {
+                            for tf in [None, Some(TransferFunction::Pq), Some(TransferFunction::Hlg), Some(TransferFunction::Srgb), Some(TransferFunction::Gamma22), Some(TransferFunction::Bt1886)] {
+                                changed |= ui.selectable_value(&mut s.color.transfer, tf, transfer_label(t, tf)).changed();
+                            }
+                        });
+                    });
+                    let range_label = |r: Option<Range>| match r {
+                        None => t.auto,
+                        Some(Range::Limited) => t.range_limited,
+                        Some(Range::Full) => t.range_full,
+                    };
+                    row(ui, t.quant_range, None, |ui| {
+                        egui::ComboBox::from_id_salt("range").selected_text(range_label(s.color.range)).show_ui(ui, |ui| {
+                            for r in [None, Some(Range::Limited), Some(Range::Full)] {
+                                changed |= ui.selectable_value(&mut s.color.range, r, range_label(r)).changed();
+                            }
+                        });
+                    });
+                    row(ui, t.assume_hdr_10bit, Some(t.assume_hdr_10bit_hint), |ui| {
+                        changed |= ui.checkbox(&mut s.color.assume_hdr_for_10bit, "").changed();
+                    });
                 });
-                let range_label = |r: Option<Range>| match r {
-                    None => t.auto,
-                    Some(Range::Limited) => t.range_limited,
-                    Some(Range::Full) => t.range_full,
-                };
-                egui::ComboBox::from_label(t.quant_range).selected_text(range_label(s.color.range)).show_ui(ui, |ui| {
-                    for r in [None, Some(Range::Limited), Some(Range::Full)] {
-                        changed |= ui.selectable_value(&mut s.color.range, r, range_label(r)).changed();
-                    }
-                });
-                changed |= ui.checkbox(&mut s.color.assume_hdr_for_10bit, t.assume_hdr_10bit).changed();
             });
 
             egui::CollapsingHeader::new(t.interpolation).default_open(true).show(ui, |ui| {
-                let label = |b: InterpolationBackend| match b {
-                    InterpolationBackend::Off => t.interp_off,
-                    InterpolationBackend::NvidiaVfg => t.interp_vfg,
-                };
-                egui::ComboBox::from_label(t.backend).selected_text(label(s.interpolation.backend)).show_ui(ui, |ui| {
-                    for b in [InterpolationBackend::Off, InterpolationBackend::NvidiaVfg] {
-                        changed |= ui.selectable_value(&mut s.interpolation.backend, b, label(b)).changed();
+                grid("interp").show(ui, |ui| {
+                    let label = |b: InterpolationBackend| match b {
+                        InterpolationBackend::Off => t.interp_off,
+                        InterpolationBackend::NvidiaVfg => t.interp_vfg,
+                    };
+                    row(ui, t.backend, None, |ui| {
+                        egui::ComboBox::from_id_salt("interp_backend").selected_text(label(s.interpolation.backend)).show_ui(ui, |ui| {
+                            for b in [InterpolationBackend::Off, InterpolationBackend::NvidiaVfg] {
+                                changed |= ui.selectable_value(&mut s.interpolation.backend, b, label(b)).changed();
+                            }
+                        });
+                    });
+                    row(ui, t.multiplier, Some(t.multiplier_note), |ui| {
+                        egui::ComboBox::from_id_salt("multiplier").selected_text(format!("{}×", s.interpolation.max_multiplier)).show_ui(ui, |ui| {
+                            for m in [2u32, 3, 4] {
+                                changed |= ui.selectable_value(&mut s.interpolation.max_multiplier, m, format!("{m}×")).changed();
+                            }
+                        });
+                    });
+                    if s.interpolation.backend == InterpolationBackend::NvidiaVfg {
+                        let q = |m: u32| [t.quality_low, t.quality_medium, t.quality_high][m.min(2) as usize];
+                        row(ui, t.vfg_quality, None, |ui| {
+                            egui::ComboBox::from_id_salt("vfg_quality").selected_text(q(s.interpolation.vfg_quality)).show_ui(ui, |ui| {
+                                for m in 0..3u32 {
+                                    changed |= ui.selectable_value(&mut s.interpolation.vfg_quality, m, q(m)).changed();
+                                }
+                            });
+                        });
                     }
-                });
-                egui::ComboBox::from_label(t.multiplier).selected_text(format!("{}×", s.interpolation.max_multiplier)).show_ui(ui, |ui| {
-                    for m in [2u32, 3, 4] {
-                        changed |= ui.selectable_value(&mut s.interpolation.max_multiplier, m, format!("{m}×")).changed();
-                    }
-                });
-                ui.small(t.multiplier_note);
-                if s.interpolation.backend == InterpolationBackend::NvidiaVfg {
-                    let q = |m: u32| [t.quality_low, t.quality_medium, t.quality_high][m.min(2) as usize];
-                    egui::ComboBox::from_label(t.vfg_quality).selected_text(q(s.interpolation.vfg_quality)).show_ui(ui, |ui| {
-                        for m in 0..3u32 {
-                            changed |= ui.selectable_value(&mut s.interpolation.vfg_quality, m, q(m)).changed();
+                    row(ui, t.freeze, None, |ui| {
+                        let mut frozen = v.frozen;
+                        if ui.checkbox(&mut frozen, "").changed() {
+                            actions.push(Action::SetFreeze(frozen));
                         }
                     });
-                }
-                ui.label(format!("{}: {}", t.status, status_label(t, v.interp)));
-                let mut frozen = v.frozen;
-                if ui.checkbox(&mut frozen, t.freeze).changed() {
-                    actions.push(Action::SetFreeze(frozen));
-                }
+                    row(ui, t.status, None, |ui| ui.label(status_label(t, v.interp)));
+                });
+            });
+
+            egui::CollapsingHeader::new(t.upscale).default_open(true).show(ui, |ui| {
+                grid("upscale").show(ui, |ui| {
+                    let label = |b: UpscaleBackend| match b {
+                        UpscaleBackend::Off => t.upscale_off,
+                        UpscaleBackend::NvidiaVsr => t.upscale_vsr,
+                    };
+                    row(ui, t.backend, None, |ui| {
+                        egui::ComboBox::from_id_salt("upscale_backend").selected_text(label(s.upscale.backend)).show_ui(ui, |ui| {
+                            for b in [UpscaleBackend::Off, UpscaleBackend::NvidiaVsr] {
+                                changed |= ui.selectable_value(&mut s.upscale.backend, b, label(b)).changed();
+                            }
+                        });
+                    });
+                    if s.upscale.backend == UpscaleBackend::NvidiaVsr {
+                        let q = |m: VsrQualitySetting| match m {
+                            VsrQualitySetting::Low => t.quality_low,
+                            VsrQualitySetting::Medium => t.quality_medium,
+                            VsrQualitySetting::High => t.quality_high,
+                            VsrQualitySetting::Ultra => t.quality_ultra,
+                        };
+                        row(ui, t.vsr_quality, None, |ui| {
+                            egui::ComboBox::from_id_salt("vsr_quality").selected_text(q(s.upscale.vsr_quality)).show_ui(ui, |ui| {
+                                for m in [VsrQualitySetting::Low, VsrQualitySetting::Medium, VsrQualitySetting::High, VsrQualitySetting::Ultra] {
+                                    changed |= ui.selectable_value(&mut s.upscale.vsr_quality, m, q(m)).changed();
+                                }
+                            });
+                        });
+                    }
+                    let detail = match (v.upscale, v.stats.upscale) {
+                        (BackendStatus::Running(_), Some((src, dst))) => {
+                            format!("{}x{} → {}x{} · {:.2} ms", src.0, src.1, dst.0, dst.1, v.stats.upscale_ms)
+                        }
+                        (BackendStatus::Running(_), None) => t.upscale_idle.to_string(),
+                        (BackendStatus::Unavailable | BackendStatus::Off, _) => t.upscale_fallback.to_string(),
+                    };
+                    row(ui, t.status, None, |ui| ui.label(format!("{}\n{detail}", status_label(t, v.upscale))));
+                });
             });
 
             egui::CollapsingHeader::new(t.audio).default_open(false).show(ui, |ui| {
-                changed |= ui.checkbox(&mut s.audio.enabled, t.audio_enable).changed();
-                changed |= ui.add(egui::Slider::new(&mut s.audio.volume, 0.0..=2.0).text(t.volume)).changed();
-                changed |= ui.add(egui::Slider::new(&mut s.audio.av_offset_ms, -50..=200).suffix(" ms").text(t.av_offset)).changed();
+                grid("audio").show(ui, |ui| {
+                    row(ui, t.audio_enable, None, |ui| {
+                        changed |= ui.checkbox(&mut s.audio.enabled, "").changed();
+                    });
+                    row(ui, t.volume, None, |ui| {
+                        changed |= ui.add(egui::Slider::new(&mut s.audio.volume, 0.0..=2.0)).changed();
+                    });
+                    row(ui, t.av_offset, None, |ui| {
+                        changed |= ui.add(egui::Slider::new(&mut s.audio.av_offset_ms, -50..=200).suffix(" ms")).changed();
+                    });
+                });
                 match v.audio {
                     Some(a) => {
                         ui.label(&a.endpoint);
@@ -239,29 +335,44 @@ pub fn draw(ctx: &egui::Context, s: &mut Settings, v: &UiView<'_>) -> Vec<Action
                     d.sdr_white_nits,
                     d.refresh_hz
                 ));
-                changed |= ui.checkbox(&mut s.display.vsync, t.vsync).changed();
-                let mut catmull = s.display.scaling == ScalingFilter::CatmullRom;
-                if ui.checkbox(&mut catmull, t.catmull).changed() {
-                    s.display.scaling = if catmull { ScalingFilter::CatmullRom } else { ScalingFilter::Bilinear };
-                    changed = true;
-                }
-                let mut peak = s.display.peak_nits_override.unwrap_or(d.max_nits);
-                let mut use_peak = s.display.peak_nits_override.is_some();
-                ui.horizontal(|ui| {
-                    changed |= ui.checkbox(&mut use_peak, t.peak_override).changed();
-                    changed |= ui.add_enabled(use_peak, egui::Slider::new(&mut peak, 200.0..=4000.0).suffix(" nit")).changed();
+                grid("display").show(ui, |ui| {
+                    row(ui, t.vsync, Some(t.vsync_hint), |ui| {
+                        changed |= ui.checkbox(&mut s.display.vsync, "").changed();
+                    });
+                    let filter_label = |f: ScalingFilter| match f {
+                        ScalingFilter::Bilinear => t.filter_bilinear,
+                        ScalingFilter::CatmullRom => t.filter_catmull,
+                    };
+                    row(ui, t.scaling, Some(t.scaling_hint), |ui| {
+                        egui::ComboBox::from_id_salt("scaling").selected_text(filter_label(s.display.scaling)).show_ui(ui, |ui| {
+                            for f in [ScalingFilter::Bilinear, ScalingFilter::CatmullRom] {
+                                changed |= ui.selectable_value(&mut s.display.scaling, f, filter_label(f)).changed();
+                            }
+                        });
+                    });
+                    let mut peak = s.display.peak_nits_override.unwrap_or(d.max_nits);
+                    let mut use_peak = s.display.peak_nits_override.is_some();
+                    row(ui, t.peak_override, None, |ui| {
+                        ui.horizontal(|ui| {
+                            changed |= ui.checkbox(&mut use_peak, "").changed();
+                            changed |= ui.add_enabled(use_peak, egui::Slider::new(&mut peak, 200.0..=4000.0).suffix(" nit")).changed();
+                        });
+                    });
+                    s.display.peak_nits_override = use_peak.then_some(peak);
                 });
-                s.display.peak_nits_override = use_peak.then_some(peak);
                 if ui.button(t.fullscreen).clicked() {
                     actions.push(Action::ToggleFullscreen);
                 }
             });
 
-            ui.horizontal(|ui| {
-                ui.label(t.language);
-                for (lang, name) in [(Language::Auto, t.auto), (Language::Zh, "中文"), (Language::En, "English")] {
-                    changed |= ui.selectable_value(&mut s.ui.language, lang, name).changed();
-                }
+            grid("language").show(ui, |ui| {
+                row(ui, t.language, None, |ui| {
+                    ui.horizontal(|ui| {
+                        for (lang, name) in [(Language::Auto, t.auto), (Language::Zh, "中文"), (Language::En, "English")] {
+                            changed |= ui.selectable_value(&mut s.ui.language, lang, name).changed();
+                        }
+                    });
+                });
             });
 
             ui.separator();

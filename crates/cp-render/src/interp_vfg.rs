@@ -9,30 +9,32 @@
 use std::path::PathBuf;
 use std::rc::Rc;
 
-use cp_nvidia::vfg::{VfgError, VfgSession};
+use cp_nvidia::vfg::VfgSession;
+use cp_nvidia::vfx::VfxError;
 use windows::Win32::Foundation::{E_FAIL, E_NOTIMPL};
 use windows::Win32::Graphics::Direct3D12::*;
-use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_TYPELESS;
 use windows::core::Result;
 
-use crate::descriptors::{CpuDescriptor, StagingHeap};
+use crate::descriptors::{CpuDescriptor, StagingHeap, raw_buffer_view};
 use crate::gpu::{Gpu, transition};
 use crate::renderer::{FrameInput, Interpolator, RecordCtx};
 use crate::shaders::{self, ComputePipeline, dispatch_2d, set_compute_constants};
 use crate::texture::{Texture, flush_barriers};
 
+/// Root constants of `vfg.hlsl` (also used by the VSR upscaler).
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct Constants {
-    width: u32,
-    height: u32,
-    pitch: u32,
-    hdr: u32,
-    sdr_white: f32,
-    pad: [f32; 3],
+pub(crate) struct Constants {
+    pub width: u32,
+    pub height: u32,
+    pub pitch: u32,
+    /// 1 = PQ / BT.2020 encoding, 0 = sRGB relative to `sdr_white`.
+    pub hdr: u32,
+    pub sdr_white: f32,
+    pub pad: [f32; 3],
 }
 
-fn vfg_err(e: VfgError) -> windows::core::Error {
+fn vfg_err(e: VfxError) -> windows::core::Error {
     windows::core::Error::new(E_FAIL, e.to_string())
 }
 
@@ -117,45 +119,7 @@ impl VfgInterpolator {
         )
         .map_err(vfg_err)?;
         let words = session.pitch / 4 * h;
-        let raw = |r: &ID3D12Resource, uav: bool| -> Result<CpuDescriptor> {
-            let d = heap.alloc().ok_or_else(windows::core::Error::empty)?;
-            // SAFETY: raw (byte-address) views of our own shared buffers.
-            unsafe {
-                if uav {
-                    let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
-                        Format: DXGI_FORMAT_R32_TYPELESS,
-                        ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
-                        Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
-                            Buffer: D3D12_BUFFER_UAV {
-                                FirstElement: 0,
-                                NumElements: words,
-                                Flags: D3D12_BUFFER_UAV_FLAG_RAW,
-                                ..Default::default()
-                            },
-                        },
-                    };
-                    gpu.device
-                        .CreateUnorderedAccessView(r, None, Some(&desc), d.handle);
-                } else {
-                    let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
-                        Format: DXGI_FORMAT_R32_TYPELESS,
-                        ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
-                        Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
-                        Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
-                            Buffer: D3D12_BUFFER_SRV {
-                                FirstElement: 0,
-                                NumElements: words,
-                                Flags: D3D12_BUFFER_SRV_FLAG_RAW,
-                                ..Default::default()
-                            },
-                        },
-                    };
-                    gpu.device
-                        .CreateShaderResourceView(r, Some(&desc), d.handle);
-                }
-            }
-            Ok(d)
-        };
+        let raw = |r: &ID3D12Resource, uav: bool| raw_buffer_view(&gpu.device, heap, r, words, uav);
         let input_uav = [raw(session.input(0), true)?, raw(session.input(1), true)?];
         let output_srv = raw(session.output(), false)?;
         self.res = Some(Resources {
@@ -310,7 +274,7 @@ impl Interpolator for VfgInterpolator {
 
 /// Ground-truth occlusion scene (moving object over a static background,
 /// see `testutil`); needs the
-/// VFG runtime in `runtime/nvidia-vfg`. Run with
+/// VFG runtime in `runtime/nvidia-vfx`. Run with
 /// `cargo test -p cp-render -- --ignored --nocapture`.
 #[cfg(test)]
 mod gpu_tests {
@@ -320,7 +284,7 @@ mod gpu_tests {
     #[test]
     #[ignore = "requires an RTX 40/50 GPU and the VFG runtime"]
     fn occlusion_moving_object_vfg() {
-        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../runtime/nvidia-vfg");
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../runtime/nvidia-vfx");
         for mode in 0..3u32 {
             for (w, h) in [(1920, 1080), (2560, 1440)] {
                 for (dx, dy) in [(24.0, 0.0), (60.0, 20.0)] {
@@ -338,5 +302,63 @@ mod gpu_tests {
                 }
             }
         }
+    }
+}
+
+/// Is `completion` (signaled on our stream after `NvVFX_Run`) really ordered
+/// after the effect's GPU work? Compare the stream-ordered completion time
+/// with a full context synchronize.
+#[cfg(test)]
+mod sync_tests {
+    use std::path::PathBuf;
+    use std::time::Instant;
+
+    use cp_nvidia::vfg::VfgSession;
+
+    use crate::testutil::Harness;
+
+    #[test]
+    #[ignore = "requires an RTX 40/50 GPU and the VFX runtime"]
+    fn completion_fence_covers_vfg_work() {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../runtime/nvidia-vfx");
+        let hs = Harness::new();
+        let mut s =
+            VfgSession::new(&hs.gpu.device, hs.gpu.adapter_luid, &dir, 2560, 1440, 1).expect("VFG");
+        // SAFETY: plain event creation.
+        let event =
+            unsafe { windows::Win32::System::Threading::CreateEventW(None, false, false, None) }
+                .expect("event");
+        let (mut fence_ms, mut ctx_ms) = (Vec::new(), Vec::new());
+        for v in 1..=12u64 {
+            // SAFETY: valid queue/fence/event.
+            unsafe { hs.gpu.queue.Signal(s.producer(), v).expect("signal") };
+            let t0 = Instant::now();
+            s.run(0, 1, 0.5, false, v).expect("run");
+            // Time until the completion fence fires (what D3D12 waits on)…
+            // SAFETY: valid fence and event.
+            unsafe {
+                s.completion()
+                    .SetEventOnCompletion(v, event)
+                    .expect("event");
+                windows::Win32::System::Threading::WaitForSingleObject(event, 5000);
+            }
+            let t1 = Instant::now();
+            // …versus until all CUDA work is really done.
+            s.synchronize_context();
+            let t2 = Instant::now();
+            if v > 2 {
+                fence_ms.push((t1 - t0).as_secs_f64() * 1e3);
+                ctx_ms.push((t2 - t0).as_secs_f64() * 1e3);
+            }
+        }
+        let med = |v: &mut Vec<f64>| {
+            v.sort_by(f64::total_cmp);
+            v[v.len() / 2]
+        };
+        println!(
+            "VFG 1440p medium: completion fence after {:.2} ms, all CUDA work after {:.2} ms",
+            med(&mut fence_ms),
+            med(&mut ctx_ms)
+        );
     }
 }
