@@ -15,6 +15,7 @@ pub mod egui_pass;
 pub mod gpu;
 pub mod gpu_timer;
 pub mod interp_vfg;
+pub mod nr_ngx;
 pub mod output;
 pub mod present_timing;
 pub mod presenter;
@@ -32,6 +33,7 @@ mod upscale_bench;
 pub use display::DisplayInfo;
 pub use egui_pass::EguiFrame;
 pub use interp_vfg::VfgInterpolator;
+pub use nr_ngx::{NgxNrEnhancer, NrPost};
 pub use present_timing::RefreshKind;
 pub use presenter::PresentResult;
 pub use renderer::{

@@ -120,13 +120,52 @@ impl Default for InterpolationSettings {
     }
 }
 
-/// Per-frame enhancement stage (runs before interpolation). No backend ships
-/// yet; officially published SDKs (e.g. a public DLSS neural rendering SDK)
-/// are added as new variants and implemented via `cp_render::Enhancer`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+/// Per-frame enhancement stage. Runs once per unique source frame, after
+/// color conversion and before interpolation, so interpolated frames and
+/// upscaled frames are built from enhanced ones.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct EnhanceSettings {
     pub backend: EnhanceBackend,
+    /// DLSS NR model: 0 auto, 1 quality, 2 performance.
+    pub nr_preset: NrPreset,
+    /// Model style: 0 default, 1 natural, 2 cinematic.
+    pub nr_style: NrStyle,
+    /// Residual gain applied to the model's edit (1.0 = the model as trained).
+    pub nr_strength: f32,
+    /// DLSSNR.Intensity: overall strength of the model's edit.
+    pub nr_intensity: f32,
+    /// DLSSNR.LocalStructureStrength.
+    pub nr_local_structure: f32,
+    /// DLSSNR.LocalToneStrength.
+    pub nr_local_tone: f32,
+    /// DLSSNR.SkinStructureStrength (0 = off).
+    pub nr_skin_structure: f32,
+    /// DLSSNR.UseAutoMask.
+    pub nr_auto_mask: bool,
+    /// DLSSNR.UICorrection.
+    pub nr_ui_correction: bool,
+    /// Directory with nvngx_dlssnr.dll. `None` = $CAPTUREPLAY_NR_RUNTIME,
+    /// then runtime/nvidia-nr next to the exe.
+    pub nr_runtime_dir: Option<String>,
+}
+
+impl Default for EnhanceSettings {
+    fn default() -> Self {
+        Self {
+            backend: EnhanceBackend::default(),
+            nr_preset: NrPreset::default(),
+            nr_style: NrStyle::default(),
+            nr_strength: 1.0,
+            nr_intensity: 1.0,
+            nr_local_structure: 1.0,
+            nr_local_tone: 1.0,
+            nr_skin_structure: 0.0,
+            nr_auto_mask: false,
+            nr_ui_correction: false,
+            nr_runtime_dir: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -134,6 +173,54 @@ pub struct EnhanceSettings {
 pub enum EnhanceBackend {
     #[default]
     Off,
+    /// NVIDIA DLSS Neural Rendering (NGX feature 18).
+    NvidiaDlssNr,
+    /// Community (unsigned) nvngx_dlssnr.dll through CapturePlay's forwarding
+    /// host. Unofficial and unsupported.
+    NvidiaDlssNrCommunity,
+}
+
+/// Runtime model hint passed as `DLSSNR.Hint.Render.Preset`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum NrPreset {
+    /// Let the model choose (0).
+    #[default]
+    Auto,
+    /// Quality model (1 on the 310.9 builds).
+    Quality,
+    /// Performance model (2 on the 310.9 builds).
+    Performance,
+}
+
+impl NrPreset {
+    pub fn code(self) -> u32 {
+        match self {
+            Self::Auto => 0,
+            Self::Quality => 1,
+            Self::Performance => 2,
+        }
+    }
+}
+
+/// DLSSNR.Style: the model's look.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum NrStyle {
+    #[default]
+    Default,
+    Natural,
+    Cinematic,
+}
+
+impl NrStyle {
+    pub fn code(self) -> u32 {
+        match self {
+            Self::Default => 0,
+            Self::Natural => 1,
+            Self::Cinematic => 2,
+        }
+    }
 }
 
 /// Upscaling of the captured frame to the display (e.g. 1440p HDR → 4K).
@@ -285,6 +372,21 @@ enabled = true
         )
         .expect("parse");
         assert_eq!(s.enhance.backend, EnhanceBackend::Off);
+    }
+
+    #[test]
+    fn dlss_nr_settings_round_trip() {
+        let mut s = Settings::new();
+        s.enhance.backend = EnhanceBackend::NvidiaDlssNr;
+        s.enhance.nr_preset = NrPreset::Performance;
+        s.enhance.nr_strength = 0.75;
+        s.enhance.nr_runtime_dir = Some("D:/nr".into());
+        let text = toml::to_string(&s).expect("serialize");
+        let back: Settings = toml::from_str(&text).expect("parse");
+        assert_eq!(back, s);
+        assert_eq!(back.enhance.nr_preset.code(), 2);
+        assert_eq!(NrPreset::Auto.code(), 0);
+        assert_eq!(NrPreset::Quality.code(), 1);
     }
 
     #[test]

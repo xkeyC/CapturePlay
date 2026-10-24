@@ -32,7 +32,7 @@ pub enum NgxError {
     NotBuilt,
     #[error("{call} failed: 0x{code:08X} ({})", result_name(*.code))]
     Call { call: &'static str, code: u32 },
-    #[error("RTX Video Super Resolution is not available (GPU or driver)")]
+    #[error("NVIDIA NGX feature is not available (GPU or driver)")]
     Unavailable,
 }
 
@@ -61,6 +61,155 @@ pub const fn built() -> bool {
 /// Feature DLLs (`nvngx_vsr.dll`) found in `dir`.
 pub fn runtime_present(dir: &Path) -> bool {
     dir.join("nvngx_vsr.dll").is_file()
+}
+
+/// Feature DLL (nvngx_dlssnr.dll) found in dir.
+pub fn nr_runtime_present(dir: &Path) -> bool {
+    dir.join("nvngx_dlssnr.dll").is_file()
+}
+
+/// Create-time options for DLSS Neural Rendering (NGX feature 18).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct NrOptions {
+    /// DLSSNR.Hint.Render.Preset: 0 leaves the model's default (or auto),
+    /// 1 selects the quality model and 2 the performance model on the
+    /// 310.9 builds. Earlier builds only know 0.
+    pub preset: u32,
+}
+
+/// Live model tuning. These keys are read at evaluation time, so changing
+/// them does not recreate the feature (the model preset does).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct NrTuning {
+    /// DLSSNR.Style: 0 default, 1 natural, 2 cinematic.
+    pub style: u32,
+    /// DLSSNR.Intensity: overall strength of the model's edit.
+    pub intensity: f32,
+    /// DLSSNR.LocalStructureStrength.
+    pub local_structure: f32,
+    /// DLSSNR.LocalToneStrength.
+    pub local_tone: f32,
+    /// DLSSNR.SkinStructureStrength.
+    pub skin_structure: f32,
+    /// DLSSNR.UseAutoMask.
+    pub auto_mask: bool,
+    /// DLSSNR.UICorrection.
+    pub ui_correction: bool,
+}
+
+impl Default for NrTuning {
+    fn default() -> Self {
+        Self {
+            style: 0,
+            intensity: 1.0,
+            local_structure: 1.0,
+            local_tone: 1.0,
+            skin_structure: 0.0,
+            auto_mask: false,
+            ui_correction: false,
+        }
+    }
+}
+
+/// One same-resolution NR evaluation. All four resources have the size the
+/// feature was created for; color is display-referred sRGB in FP16, depth is
+/// R32_FLOAT, motion is R16G16_FLOAT in render pixels and output is FP16 like
+/// color.
+#[derive(Debug, Clone, Copy)]
+pub struct NrFrame<'a> {
+    pub color: &'a ID3D12Resource,
+    pub depth: &'a ID3D12Resource,
+    pub motion: &'a ID3D12Resource,
+    pub output: &'a ID3D12Resource,
+    /// Discards temporal history (first frame, source change, cut).
+    pub reset: bool,
+    pub tuning: NrTuning,
+}
+
+/// How the DLSS Neural Rendering feature is obtained.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NrRoute {
+    /// Through the installed NGX runtime. Feature 18 is not in the public
+    /// feature table, so this only works if the driver exposes it.
+    Official,
+    /// Through the forwarding host `captureplay_nvngx.dll` and an unsigned
+    /// community `nvngx_dlssnr.dll`. Unsupported and experimental; see
+    /// README 6.4.
+    Community { bridge: PathBuf, snippet: PathBuf },
+}
+
+/// A DLSS Neural Rendering feature instance, created for one size.
+pub struct NrFeature {
+    #[cfg(ngx)]
+    inner: imp::NrFeature,
+}
+
+impl std::fmt::Debug for NrFeature {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("NrFeature")
+    }
+}
+
+impl NrFeature {
+    /// Whether the installed NGX runtime advertises feature 18.
+    ///
+    /// The feature is not part of the public SDK: an NGX runtime that does
+    /// not know it reports "not implemented" and feature creation would fail
+    /// (or, on some drivers, fault), so callers must ask first.
+    #[cfg_attr(not(ngx), allow(unused_variables))]
+    pub fn supported(device: &ID3D12Device) -> Result<bool, NgxError> {
+        #[cfg(ngx)]
+        {
+            imp::nr_supported(device)
+        }
+        #[cfg(not(ngx))]
+        {
+            Ok(false)
+        }
+    }
+
+    /// Initializes NGX for device and creates the feature for width x height.
+    /// Creation work is recorded on list, which the caller must execute before
+    /// the first evaluate call.
+    #[cfg_attr(not(ngx), allow(unused_variables))]
+    #[cfg_attr(not(ngx), allow(unused_variables))]
+    pub fn create(
+        device: &ID3D12Device,
+        list: &ID3D12GraphicsCommandList,
+        feature_dirs: &[PathBuf],
+        data_dir: &Path,
+        size: (u32, u32),
+        options: NrOptions,
+        route: &NrRoute,
+    ) -> Result<Self, NgxError> {
+        #[cfg(ngx)]
+        {
+            imp::NrFeature::create(device, list, feature_dirs, data_dir, size, options, route)
+                .map(|inner| Self { inner })
+        }
+        #[cfg(not(ngx))]
+        {
+            Err(NgxError::NotBuilt)
+        }
+    }
+
+    /// Records one evaluation. NGX changes the command list's state and
+    /// bindings: callers re-bind their descriptor heap afterwards.
+    #[cfg_attr(not(ngx), allow(unused_variables))]
+    pub fn evaluate(
+        &self,
+        list: &ID3D12GraphicsCommandList,
+        frame: &NrFrame<'_>,
+    ) -> Result<(), NgxError> {
+        #[cfg(ngx)]
+        {
+            self.inner.evaluate(list, frame)
+        }
+        #[cfg(not(ngx))]
+        {
+            Err(NgxError::NotBuilt)
+        }
+    }
 }
 
 /// An RTX VSR feature instance. Sizes and quality are given per call, so one
@@ -130,14 +279,18 @@ impl VsrFeature {
 mod imp {
     use std::ffi::{CStr, c_char, c_void};
     use std::path::{Path, PathBuf};
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::{Arc, Mutex, OnceLock};
 
+    use windows::Win32::Foundation::HMODULE;
     use windows::Win32::Graphics::Direct3D12::{
         ID3D12Device, ID3D12GraphicsCommandList, ID3D12Resource,
     };
-    use windows::core::Interface;
+    use windows::Win32::System::LibraryLoader::{
+        GetProcAddress, LOAD_WITH_ALTERED_SEARCH_PATH, LoadLibraryExW,
+    };
+    use windows::core::{Interface, PCSTR, PCWSTR, s};
 
-    use super::{NgxError, VsrQuality};
+    use super::{NgxError, NrFrame, NrOptions, NrRoute, VsrQuality};
 
     // ---- FFI (nvsdk_ngx.h, nvsdk_ngx_params.h, nvsdk_ngx_defs*.h) ----
 
@@ -207,7 +360,44 @@ mod imp {
             value: *mut c_void,
         );
         fn NVSDK_NGX_Parameter_GetI(p: *mut Parameter, name: *const c_char, out: *mut i32) -> u32;
+        fn NVSDK_NGX_Parameter_SetI(p: *mut Parameter, name: *const c_char, value: i32);
+        fn NVSDK_NGX_Parameter_SetF(p: *mut Parameter, name: *const c_char, value: f32);
+        fn NVSDK_NGX_D3D12_AllocateParameters(out: *mut *mut Parameter) -> u32;
+        fn NVSDK_NGX_D3D12_DestroyParameters(p: *mut Parameter) -> u32;
+        fn NVSDK_NGX_D3D12_GetFeatureRequirements(
+            adapter: *mut c_void,
+            info: *const FeatureDiscoveryInfo,
+            out: *mut FeatureRequirement,
+        ) -> u32;
     }
+
+    /// NVSDK_NGX_Application_Identifier: a type tag and an 8-byte union
+    /// (ProjectDesc is three pointers; only ApplicationId is ever set here).
+    #[repr(C)]
+    struct AppIdentifier {
+        kind: i32,
+        _reserved: i32,
+        payload: [u64; 3],
+    }
+
+    #[repr(C)]
+    struct FeatureDiscoveryInfo {
+        version: u32,
+        feature: i32,
+        identifier: AppIdentifier,
+        data_path: *const u16,
+        feature_info: *const FeatureCommonInfo,
+    }
+
+    #[repr(C)]
+    struct FeatureRequirement {
+        supported: i32,
+        min_arch: u32,
+        min_os: [u8; 255],
+    }
+
+    /// NVSDK_NGX_Feature_Reserved18: DLSS Neural Rendering.
+    const FEATURE_NR: i32 = 18;
 
     fn succeeded(r: u32) -> bool {
         (r & 0xFFF0_0000) != 0xBAD0_0000
@@ -375,6 +565,463 @@ mod imp {
                         std::ptr::null(),
                     ),
                 )
+            }
+        }
+    }
+
+    fn nr_adapter(device: &ID3D12Device) -> Option<windows::Win32::Graphics::Dxgi::IDXGIAdapter> {
+        use windows::Win32::Graphics::Dxgi::IDXGIDevice;
+        let dxgi: IDXGIDevice = device.cast().ok()?;
+        // SAFETY: valid COM object owned by the device.
+        unsafe { dxgi.GetAdapter().ok() }
+    }
+
+    /// Feature 18 support from the NGX feature table. The caller holds LOCK.
+    fn nr_supported_locked(device: &ID3D12Device) -> Result<bool, NgxError> {
+        let Some(adapter) = nr_adapter(device) else {
+            return Ok(false);
+        };
+        let info = FeatureDiscoveryInfo {
+            version: VERSION_API,
+            feature: FEATURE_NR,
+            identifier: AppIdentifier {
+                kind: 0,
+                _reserved: 0,
+                payload: [0; 3],
+            },
+            data_path: std::ptr::null(),
+            feature_info: std::ptr::null(),
+        };
+        let mut requirement = FeatureRequirement {
+            supported: 0,
+            min_arch: 0,
+            min_os: [0; 255],
+        };
+        // SAFETY: valid adapter and output struct; the query only reads them.
+        let r = unsafe {
+            NVSDK_NGX_D3D12_GetFeatureRequirements(adapter.as_raw(), &info, &mut requirement)
+        };
+        if !succeeded(r) {
+            // NotImplemented is the normal answer on runtimes without NR.
+            return Ok(false);
+        }
+        Ok(requirement.supported == 0)
+    }
+
+    pub(super) fn nr_supported(device: &ID3D12Device) -> Result<bool, NgxError> {
+        let _g = LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        nr_supported_locked(device)
+    }
+
+    type BridgeLoad = unsafe extern "system" fn(*const u16) -> i32;
+    type BridgeInit =
+        unsafe extern "system" fn(u64, *const u16, *mut c_void, u32, *const c_void) -> i32;
+    type BridgeCreate =
+        unsafe extern "system" fn(*mut c_void, i32, *const c_void, *mut *mut c_void) -> i32;
+    type BridgeEvaluate =
+        unsafe extern "system" fn(*mut c_void, *const c_void, *const c_void, *const c_void) -> i32;
+    type BridgeRelease = unsafe extern "system" fn(*mut c_void) -> i32;
+
+    /// The CapturePlay forwarding host (captureplay_nvngx.dll) and its
+    /// exported entry points. Loading that host rather than the snippet
+    /// directly is what makes community builds accept the caller; see the
+    /// crate docs of nr-bridge.
+    struct Bridge {
+        _module: isize,
+        load: BridgeLoad,
+        init: BridgeInit,
+        create: BridgeCreate,
+        evaluate: BridgeEvaluate,
+        release: BridgeRelease,
+    }
+
+    // SAFETY: the DLL stays loaded for the process and calls are serialized
+    // by LOCK.
+    unsafe impl Send for Bridge {}
+    // SAFETY: same as above; the function pointers are immutable after load.
+    unsafe impl Sync for Bridge {}
+
+    static BRIDGE: Mutex<Option<(PathBuf, Arc<Bridge>)>> = Mutex::new(None);
+    /// Result of the snippet's one-shot Init_Ext.
+    static COMMUNITY_INIT: Mutex<Option<std::result::Result<(), u32>>> = Mutex::new(None);
+
+    unsafe fn symbol<T>(module: HMODULE, name: PCSTR) -> Option<T> {
+        // SAFETY: module comes from LoadLibraryExW and stays loaded.
+        let f = unsafe { GetProcAddress(module, name) }?;
+        // SAFETY: the caller picks the signature matching the export.
+        Some(unsafe { std::mem::transmute_copy::<_, T>(&f) })
+    }
+
+    fn bridge(path: &Path) -> Result<Arc<Bridge>, NgxError> {
+        let mut cache = BRIDGE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((known, found)) = cache.as_ref() {
+            return if known == path {
+                Ok(found.clone())
+            } else {
+                Err(NgxError::Unavailable)
+            };
+        }
+        let wide_path = wide(path.as_os_str());
+        // SAFETY: user-supplied path to our own forwarding DLL.
+        let module = unsafe {
+            LoadLibraryExW(
+                PCWSTR(wide_path.as_ptr()),
+                None,
+                LOAD_WITH_ALTERED_SEARCH_PATH,
+            )
+        }
+        .map_err(|_| NgxError::Unavailable)?;
+        let raw = module.0 as isize;
+        // SAFETY: names are the host's documented exports.
+        let (Some(load), Some(init), Some(create), Some(evaluate), Some(release)) = (unsafe {
+            (
+                symbol::<BridgeLoad>(module, s!("cp_nr_load")),
+                symbol::<BridgeInit>(module, s!("cp_nr_init")),
+                symbol::<BridgeCreate>(module, s!("cp_nr_create")),
+                symbol::<BridgeEvaluate>(module, s!("cp_nr_evaluate")),
+                symbol::<BridgeRelease>(module, s!("cp_nr_release")),
+            )
+        }) else {
+            return Err(NgxError::Unavailable);
+        };
+        let found = Arc::new(Bridge {
+            _module: raw,
+            load,
+            init,
+            create,
+            evaluate,
+            release,
+        });
+        *cache = Some((path.to_owned(), found.clone()));
+        Ok(found)
+    }
+
+    fn alloc_params() -> Result<*mut Parameter, NgxError> {
+        let mut params: *mut Parameter = std::ptr::null_mut();
+        // SAFETY: NGX allocates and owns the parameter block.
+        check("NVSDK_NGX_D3D12_AllocateParameters", unsafe {
+            NVSDK_NGX_D3D12_AllocateParameters(&mut params)
+        })?;
+        if params.is_null() {
+            Err(NgxError::Unavailable)
+        } else {
+            Ok(params)
+        }
+    }
+
+    fn fill_create(params: *mut Parameter, width: u32, height: u32, options: NrOptions) {
+        // SAFETY: fresh NGX-owned parameter block; neither the generic nor
+        // the DLSSNR-prefixed size keys are documented, so both are set.
+        unsafe {
+            NVSDK_NGX_Parameter_SetUI(params, c"CreationNodeMask".as_ptr(), 1);
+            NVSDK_NGX_Parameter_SetUI(params, c"VisibilityNodeMask".as_ptr(), 1);
+            NVSDK_NGX_Parameter_SetUI(params, c"Width".as_ptr(), width);
+            NVSDK_NGX_Parameter_SetUI(params, c"Height".as_ptr(), height);
+            NVSDK_NGX_Parameter_SetUI(params, c"OutWidth".as_ptr(), width);
+            NVSDK_NGX_Parameter_SetUI(params, c"OutHeight".as_ptr(), height);
+            NVSDK_NGX_Parameter_SetUI(params, c"DLSSNR.InputWidth".as_ptr(), width);
+            NVSDK_NGX_Parameter_SetUI(params, c"DLSSNR.InputHeight".as_ptr(), height);
+            NVSDK_NGX_Parameter_SetUI(params, c"DLSSNR.OutputWidth".as_ptr(), width);
+            NVSDK_NGX_Parameter_SetUI(params, c"DLSSNR.OutputHeight".as_ptr(), height);
+            NVSDK_NGX_Parameter_SetUI(params, c"DLSSNR.Width".as_ptr(), width);
+            NVSDK_NGX_Parameter_SetUI(params, c"DLSSNR.Height".as_ptr(), height);
+            NVSDK_NGX_Parameter_SetI(params, c"DLSSNR.Enabled".as_ptr(), 1);
+            NVSDK_NGX_Parameter_SetI(params, c"DLSSNR.Upscaling".as_ptr(), 0);
+            NVSDK_NGX_Parameter_SetF(params, c"DLSSNR.Scale".as_ptr(), 1.0);
+            NVSDK_NGX_Parameter_SetF(params, c"DLSSNR.ScalingRatio".as_ptr(), 1.0);
+            NVSDK_NGX_Parameter_SetI(
+                params,
+                c"DLSSNR.Hint.Render.Preset".as_ptr(),
+                options.preset as i32,
+            );
+        }
+    }
+
+    fn fill_eval(params: *mut Parameter, frame: &NrFrame<'_>) {
+        let size = |t: &ID3D12Resource| {
+            // NGX wants subrect sizes; every resource passed here is the size
+            // the feature was created for, read from its descriptor.
+            // SAFETY: valid resource; GetDesc only reads it.
+            let desc = unsafe { t.GetDesc() };
+            (desc.Width as u32, desc.Height)
+        };
+        let (w, h) = size(frame.color);
+        let out = size(frame.output);
+        // SAFETY: NGX-owned parameter block; the resources outlive the
+        // recorded command list (owned by the caller's frame).
+        unsafe {
+            NVSDK_NGX_Parameter_SetD3d12Resource(
+                params,
+                c"DLSSNR.Color".as_ptr(),
+                frame.color.as_raw(),
+            );
+            NVSDK_NGX_Parameter_SetD3d12Resource(
+                params,
+                c"DLSSNR.Depth".as_ptr(),
+                frame.depth.as_raw(),
+            );
+            NVSDK_NGX_Parameter_SetD3d12Resource(
+                params,
+                c"DLSSNR.MVec".as_ptr(),
+                frame.motion.as_raw(),
+            );
+            NVSDK_NGX_Parameter_SetD3d12Resource(
+                params,
+                c"DLSSNR.Output".as_ptr(),
+                frame.output.as_raw(),
+            );
+            NVSDK_NGX_Parameter_SetI(params, c"DLSSNR.Enabled".as_ptr(), 1);
+            NVSDK_NGX_Parameter_SetI(params, c"DLSSNR.Reset".as_ptr(), i32::from(frame.reset));
+            NVSDK_NGX_Parameter_SetI(params, c"DLSSNR.DepthInverted".as_ptr(), 0);
+            NVSDK_NGX_Parameter_SetUI(params, c"DLSSNR.ColorSubrectBaseX".as_ptr(), 0);
+            NVSDK_NGX_Parameter_SetUI(params, c"DLSSNR.ColorSubrectBaseY".as_ptr(), 0);
+            NVSDK_NGX_Parameter_SetUI(params, c"DLSSNR.ColorSubrectWidth".as_ptr(), w);
+            NVSDK_NGX_Parameter_SetUI(params, c"DLSSNR.ColorSubrectHeight".as_ptr(), h);
+            NVSDK_NGX_Parameter_SetUI(params, c"DLSSNR.DepthSubrectBaseX".as_ptr(), 0);
+            NVSDK_NGX_Parameter_SetUI(params, c"DLSSNR.DepthSubrectBaseY".as_ptr(), 0);
+            NVSDK_NGX_Parameter_SetUI(params, c"DLSSNR.DepthSubrectWidth".as_ptr(), w);
+            NVSDK_NGX_Parameter_SetUI(params, c"DLSSNR.DepthSubrectHeight".as_ptr(), h);
+            NVSDK_NGX_Parameter_SetUI(params, c"DLSSNR.MVecSubrectBaseX".as_ptr(), 0);
+            NVSDK_NGX_Parameter_SetUI(params, c"DLSSNR.MVecSubrectBaseY".as_ptr(), 0);
+            NVSDK_NGX_Parameter_SetUI(params, c"DLSSNR.MVecSubrectWidth".as_ptr(), w);
+            NVSDK_NGX_Parameter_SetUI(params, c"DLSSNR.MVecSubrectHeight".as_ptr(), h);
+            NVSDK_NGX_Parameter_SetUI(params, c"DLSSNR.OutputSubrectBaseX".as_ptr(), 0);
+            NVSDK_NGX_Parameter_SetUI(params, c"DLSSNR.OutputSubrectBaseY".as_ptr(), 0);
+            NVSDK_NGX_Parameter_SetUI(params, c"DLSSNR.OutputSubrectWidth".as_ptr(), out.0);
+            NVSDK_NGX_Parameter_SetUI(params, c"DLSSNR.OutputSubrectHeight".as_ptr(), out.1);
+            NVSDK_NGX_Parameter_SetF(params, c"DLSSNR.MVecScaleX".as_ptr(), 1.0);
+            NVSDK_NGX_Parameter_SetF(params, c"DLSSNR.MVecScaleY".as_ptr(), 1.0);
+            let t = frame.tuning;
+            NVSDK_NGX_Parameter_SetUI(params, c"DLSSNR.Style".as_ptr(), t.style);
+            NVSDK_NGX_Parameter_SetF(params, c"DLSSNR.Intensity".as_ptr(), t.intensity);
+            NVSDK_NGX_Parameter_SetF(
+                params,
+                c"DLSSNR.LocalStructureStrength".as_ptr(),
+                t.local_structure,
+            );
+            NVSDK_NGX_Parameter_SetF(params, c"DLSSNR.LocalToneStrength".as_ptr(), t.local_tone);
+            NVSDK_NGX_Parameter_SetF(
+                params,
+                c"DLSSNR.SkinStructureStrength".as_ptr(),
+                t.skin_structure,
+            );
+            NVSDK_NGX_Parameter_SetUI(
+                params,
+                c"DLSSNR.UseAutoMask".as_ptr(),
+                u32::from(t.auto_mask),
+            );
+            NVSDK_NGX_Parameter_SetUI(
+                params,
+                c"DLSSNR.UICorrection".as_ptr(),
+                u32::from(t.ui_correction),
+            );
+        }
+    }
+
+    enum Route {
+        Core,
+        Community(Arc<Bridge>),
+    }
+
+    pub(super) struct NrFeature {
+        handle: *mut Handle,
+        params: *mut Parameter,
+        route: Route,
+    }
+
+    // SAFETY: the handle and parameter block are used under LOCK only.
+    unsafe impl Send for NrFeature {}
+
+    impl NrFeature {
+        pub(super) fn create(
+            device: &ID3D12Device,
+            list: &ID3D12GraphicsCommandList,
+            feature_dirs: &[PathBuf],
+            data_dir: &Path,
+            (width, height): (u32, u32),
+            options: NrOptions,
+            route: &NrRoute,
+        ) -> Result<Self, NgxError> {
+            let _g = LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            instance(device, feature_dirs, data_dir)?;
+            match route {
+                NrRoute::Official => {
+                    if !nr_supported_locked(device)? {
+                        tracing::info!(
+                            "NGX feature 18 (DLSS Neural Rendering) is not offered by this runtime"
+                        );
+                        return Err(NgxError::Unavailable);
+                    }
+                    let params = alloc_params()?;
+                    fill_create(params, width, height, options);
+                    let mut handle: *mut Handle = std::ptr::null_mut();
+                    // SAFETY: valid list, parameter block and out-pointer.
+                    let r = unsafe {
+                        NVSDK_NGX_D3D12_CreateFeature(
+                            list.as_raw(),
+                            FEATURE_NR,
+                            params,
+                            &mut handle,
+                        )
+                    };
+                    if !succeeded(r) || handle.is_null() {
+                        // SAFETY: the block is ours and no feature exists.
+                        unsafe {
+                            let _ = NVSDK_NGX_D3D12_DestroyParameters(params);
+                        }
+                        return Err(NgxError::Call {
+                            call: "NVSDK_NGX_D3D12_CreateFeature(NR)",
+                            code: r,
+                        });
+                    }
+                    Ok(Self {
+                        handle,
+                        params,
+                        route: Route::Core,
+                    })
+                }
+                NrRoute::Community {
+                    bridge: bridge_path,
+                    snippet,
+                } => {
+                    let bridge = bridge(bridge_path)?;
+                    let wide_snippet = wide(snippet.as_os_str());
+                    // SAFETY: path is a valid NUL-terminated wide string.
+                    if unsafe { (bridge.load)(wide_snippet.as_ptr()) } != 1 {
+                        tracing::warn!(?snippet, "cannot load the community NR snippet");
+                        return Err(NgxError::Unavailable);
+                    }
+                    let params = alloc_params()?;
+                    let init = {
+                        let mut slot = COMMUNITY_INIT
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        match *slot {
+                            Some(result) => result,
+                            None => {
+                                let data = wide(data_dir.as_os_str());
+                                // SAFETY: valid device, data path and block.
+                                let r = unsafe {
+                                    (bridge.init)(
+                                        0,
+                                        data.as_ptr(),
+                                        device.as_raw(),
+                                        VERSION_API,
+                                        params.cast(),
+                                    )
+                                };
+                                let result = if r == 1 { Ok(()) } else { Err(r as u32) };
+                                *slot = Some(result);
+                                result
+                            }
+                        }
+                    };
+                    if let Err(code) = init {
+                        // SAFETY: the block is ours and was not used.
+                        unsafe {
+                            let _ = NVSDK_NGX_D3D12_DestroyParameters(params);
+                        }
+                        return Err(NgxError::Call {
+                            call: "community snippet Init_Ext",
+                            code,
+                        });
+                    }
+                    fill_create(params, width, height, options);
+                    let mut handle: *mut Handle = std::ptr::null_mut();
+                    let out: *mut *mut c_void = (&mut handle as *mut *mut Handle).cast();
+                    // SAFETY: forwarded to the snippet under LOCK.
+                    let r =
+                        unsafe { (bridge.create)(list.as_raw(), FEATURE_NR, params.cast(), out) };
+                    if r != 1 || handle.is_null() {
+                        // SAFETY: the block is ours and no feature exists.
+                        unsafe {
+                            let _ = NVSDK_NGX_D3D12_DestroyParameters(params);
+                        }
+                        return Err(NgxError::Call {
+                            call: "community snippet CreateFeature(NR)",
+                            code: r as u32,
+                        });
+                    }
+                    tracing::info!(?snippet, "community DLSS NR feature created");
+                    Ok(Self {
+                        handle,
+                        params,
+                        route: Route::Community(bridge),
+                    })
+                }
+            }
+        }
+
+        pub(super) fn evaluate(
+            &self,
+            list: &ID3D12GraphicsCommandList,
+            frame: &NrFrame<'_>,
+        ) -> Result<(), NgxError> {
+            let _g = LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            fill_eval(self.params, frame);
+            match &self.route {
+                // SAFETY: NGX-owned handle and parameter block; the resources
+                // outlive the recorded list (owned by the caller's frame).
+                Route::Core => check("NVSDK_NGX_D3D12_EvaluateFeature(NR)", unsafe {
+                    NVSDK_NGX_D3D12_EvaluateFeature_C(
+                        list.as_raw(),
+                        self.handle,
+                        self.params,
+                        std::ptr::null(),
+                    )
+                }),
+                Route::Community(bridge) => {
+                    // SAFETY: forwarded to the snippet under LOCK.
+                    let r = unsafe {
+                        (bridge.evaluate)(
+                            list.as_raw(),
+                            self.handle.cast(),
+                            self.params.cast(),
+                            std::ptr::null(),
+                        )
+                    };
+                    if r == 1 {
+                        Ok(())
+                    } else {
+                        Err(NgxError::Call {
+                            call: "community snippet EvaluateFeature(NR)",
+                            code: r as u32,
+                        })
+                    }
+                }
+            }
+        }
+    }
+
+    impl Drop for NrFeature {
+        fn drop(&mut self) {
+            let _g = LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // SAFETY: handle and parameters were created by NGX; the GPU must
+            // be idle with respect to the feature (owner's responsibility).
+            unsafe {
+                if !self.handle.is_null() {
+                    match &self.route {
+                        Route::Core => {
+                            let _ = NVSDK_NGX_D3D12_ReleaseFeature(self.handle);
+                        }
+                        Route::Community(bridge) => {
+                            let _ = (bridge.release)(self.handle.cast());
+                        }
+                    }
+                }
+                if !self.params.is_null() {
+                    let _ = NVSDK_NGX_D3D12_DestroyParameters(self.params);
+                }
             }
         }
     }

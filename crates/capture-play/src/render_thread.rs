@@ -161,6 +161,66 @@ fn rtx_video_dirs() -> Vec<std::path::PathBuf> {
     dirs
 }
 
+/// Folders searched for `nvngx_dlssnr.dll` (DLSS Neural Rendering), in
+/// order: the configured folder, `$CAPTUREPLAY_NR_RUNTIME`, the executable's
+/// folder, then `runtime/nvidia-nr` next to the executable or in any parent.
+fn nr_runtime_dirs(s: &Settings) -> Vec<std::path::PathBuf> {
+    let exe = std::env::current_exe().unwrap_or_default();
+    let mut dirs: Vec<std::path::PathBuf> = Vec::new();
+    if let Some(d) = &s.enhance.nr_runtime_dir {
+        dirs.push(d.into());
+    }
+    dirs.extend(std::env::var_os("CAPTUREPLAY_NR_RUNTIME").map(Into::into));
+    dirs.extend(exe.parent().map(std::path::Path::to_path_buf));
+    dirs.extend(
+        exe.ancestors()
+            .skip(1)
+            .map(|d| d.join("runtime").join("nvidia-nr")),
+    );
+    dirs
+}
+
+/// The CapturePlay forwarding host used by the community NR backend.
+fn nr_bridge_path() -> Option<std::path::PathBuf> {
+    if let Some(p) = std::env::var_os("CAPTUREPLAY_NR_BRIDGE") {
+        let p = std::path::PathBuf::from(p);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    let exe = std::env::current_exe().unwrap_or_default();
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    candidates.extend(exe.parent().map(|d| d.join("captureplay_nvngx.dll")));
+    candidates.extend(exe.ancestors().skip(1).map(|d| {
+        d.join("runtime")
+            .join("nvidia-nr")
+            .join("captureplay_nvngx.dll")
+    }));
+    candidates.into_iter().find(|p| p.is_file())
+}
+
+/// Every folder NGX may load a feature DLL from. NGX is initialized once per
+/// process with this list, so both features must be named here even when only
+/// one of them is enabled.
+fn ngx_feature_dirs(s: &Settings) -> Vec<std::path::PathBuf> {
+    let mut dirs = rtx_video_dirs();
+    dirs.extend(nr_runtime_dirs(s));
+    dirs
+}
+
+/// Live DLSS NR model tuning (read at every evaluation).
+fn nr_tuning(s: &cp_core::settings::EnhanceSettings) -> cp_nvidia::ngx::NrTuning {
+    cp_nvidia::ngx::NrTuning {
+        style: s.nr_style.code(),
+        intensity: s.nr_intensity,
+        local_structure: s.nr_local_structure,
+        local_tone: s.nr_local_tone,
+        skin_structure: s.nr_skin_structure,
+        auto_mask: s.nr_auto_mask,
+        ui_correction: s.nr_ui_correction,
+    }
+}
+
 /// Where the NVIDIA Video Effects runtime DLLs (VFG) are looked up.
 fn vfx_runtime_dir(s: &Settings) -> std::path::PathBuf {
     if let Some(d) = &s.interpolation.vfx_runtime_dir {
@@ -229,6 +289,7 @@ impl RateMeter {
             content = format!("{:.1}", s.content_fps),
             latency_ms = format!("{:.1}", s.latency_ms),
             interp_gpu_ms = format!("{:.2}", s.interp_gpu_ms),
+            enhance_gpu_ms = format!("{:.2}", s.enhance_gpu_ms),
             upscale = s
                 .upscale
                 .map(|(a, b)| format!("{}x{}->{}x{} {:.2}ms", a.0, a.1, b.0, b.1, s.upscale_ms))
@@ -257,6 +318,7 @@ struct State {
     proxy: EventLoopProxy<ToMain>,
     interp_backend: Option<(InterpolationBackend, u32)>,
     upscale_backend: Option<cp_core::settings::UpscaleSettings>,
+    enhance_backend: Option<cp_core::settings::EnhanceSettings>,
     audio: Option<cp_audio::AudioPassthrough>,
     audio_endpoint: Option<String>,
 }
@@ -401,7 +463,7 @@ impl State {
                 };
                 match cp_render::NgxVsrUpscaler::new(
                     self.renderer.gpu(),
-                    rtx_video_dirs(),
+                    ngx_feature_dirs(&self.settings),
                     config::data_dir().join("ngx"),
                     quality,
                 ) {
@@ -416,9 +478,75 @@ impl State {
         self.renderer.set_upscaler(upscaler);
     }
 
+    /// (Re)creates the per-frame enhancement stage when its settings changed.
+    fn apply_enhancer(&mut self) {
+        use cp_core::settings::EnhanceBackend;
+        let want = self.settings.enhance.clone();
+        if let Some(prev) = self.enhance_backend.clone() {
+            let same = prev.backend == want.backend
+                && prev.nr_preset == want.nr_preset
+                && prev.nr_runtime_dir == want.nr_runtime_dir;
+            if same {
+                // Strength and model tuning are per-evaluate keys; do not
+                // reload the model when only they change.
+                self.renderer.set_enhance_strength(want.nr_strength);
+                self.renderer.set_nr_tuning(nr_tuning(&want));
+                self.enhance_backend = Some(want);
+                return;
+            }
+        }
+        self.enhance_backend = Some(want.clone());
+        let route = match want.backend {
+            EnhanceBackend::Off => None,
+            EnhanceBackend::NvidiaDlssNr => Some(cp_nvidia::ngx::NrRoute::Official),
+            EnhanceBackend::NvidiaDlssNrCommunity => {
+                let snippet = nr_runtime_dirs(&self.settings)
+                    .into_iter()
+                    .map(|d| d.join("nvngx_dlssnr.dll"))
+                    .find(|p| p.is_file());
+                match (nr_bridge_path(), snippet) {
+                    (Some(bridge), Some(snippet)) => {
+                        Some(cp_nvidia::ngx::NrRoute::Community { bridge, snippet })
+                    }
+                    _ => {
+                        tracing::warn!(
+                            "community DLSS NR needs captureplay_nvngx.dll and nvngx_dlssnr.dll"
+                        );
+                        None
+                    }
+                }
+            }
+        };
+        let enhancer: Option<Box<dyn cp_render::Enhancer>> = match route {
+            None => None,
+            Some(route) => match cp_render::NgxNrEnhancer::new(
+                self.renderer.gpu(),
+                ngx_feature_dirs(&self.settings),
+                config::data_dir().join("ngx"),
+                cp_nvidia::ngx::NrOptions {
+                    preset: want.nr_preset.code(),
+                },
+                route,
+                nr_tuning(&want),
+                cp_render::NrPost {
+                    detail: want.nr_strength,
+                    colour: 1.0,
+                },
+            ) {
+                Ok(e) => Some(Box::new(e)),
+                Err(e) => {
+                    tracing::warn!("DLSS NR unavailable: {e}");
+                    None
+                }
+            },
+        };
+        self.renderer.set_enhancer(enhancer);
+    }
+
     fn apply_settings(&mut self) {
         self.apply_interpolator();
         self.apply_upscaler();
+        self.apply_enhancer();
         match (&self.audio, self.settings.audio.enabled) {
             (Some(a), true) => {
                 a.set_volume(self.settings.audio.volume);
@@ -536,11 +664,13 @@ fn run(
         proxy,
         interp_backend: None,
         upscale_backend: None,
+        enhance_backend: None,
         audio: None,
         audio_endpoint: None,
     };
     st.apply_interpolator();
     st.apply_upscaler();
+    st.apply_enhancer();
     st.start_capture();
 
     let mut overlay = true;
@@ -680,6 +810,11 @@ fn run(
                         (cp_core::settings::UpscaleBackend::Off, _) => BackendStatus::Off,
                         (_, Some(n)) => BackendStatus::Running(n),
                         (_, None) => BackendStatus::Unavailable,
+                    },
+                    enhance: match (st.settings.enhance.backend, st.renderer.enhancer_name()) {
+                        (cp_core::settings::EnhanceBackend::Off, _) => BackendStatus::Off,
+                        (_, Some(n)) if st.renderer.enhancer_ready() => BackendStatus::Running(n),
+                        _ => BackendStatus::Unavailable,
                     },
                     frozen: st.renderer.frozen(),
                     audio: audio.as_ref(),

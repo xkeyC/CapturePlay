@@ -7,8 +7,8 @@
 use cp_capture::DeviceInfo;
 use cp_core::format::ModeRequest;
 use cp_core::settings::{
-    InterpolationBackend, Language, RefreshMode, ScalingFilter, Settings, UpscaleBackend,
-    VsrQualitySetting,
+    EnhanceBackend, InterpolationBackend, Language, NrPreset, NrStyle, RefreshMode, ScalingFilter,
+    Settings, UpscaleBackend, VsrQualitySetting,
 };
 use cp_core::{ColorDesc, Range, TransferFunction, VideoMode};
 use cp_render::{DisplayInfo, RefreshKind, RenderStats};
@@ -47,6 +47,7 @@ pub struct UiView<'a> {
     pub adapter: &'a str,
     pub interp: BackendStatus,
     pub upscale: BackendStatus,
+    pub enhance: BackendStatus,
     pub frozen: bool,
     pub audio: Option<&'a AudioView>,
 }
@@ -238,6 +239,84 @@ pub fn draw(ctx: &egui::Context, s: &mut Settings, v: &UiView<'_>) -> Vec<Action
                         changed |= ui.checkbox(&mut s.color.assume_hdr_for_10bit, "").changed();
                     });
                 });
+            });
+
+            egui::CollapsingHeader::new(t.enhance).default_open(true).show(ui, |ui| {
+                grid("enhance").show(ui, |ui| {
+                    let label = |b: EnhanceBackend| match b {
+                        EnhanceBackend::Off => t.enhance_off,
+                        EnhanceBackend::NvidiaDlssNr => t.enhance_nr,
+                        EnhanceBackend::NvidiaDlssNrCommunity => t.enhance_nr_community,
+                    };
+                    row(ui, t.backend, None, |ui| {
+                        egui::ComboBox::from_id_salt("enhance_backend").selected_text(label(s.enhance.backend)).show_ui(ui, |ui| {
+                            for b in [EnhanceBackend::Off, EnhanceBackend::NvidiaDlssNr, EnhanceBackend::NvidiaDlssNrCommunity] {
+                                let resp = ui.selectable_value(&mut s.enhance.backend, b, label(b));
+                                let resp = if b == EnhanceBackend::NvidiaDlssNrCommunity {
+                                    resp.on_hover_text(t.nr_community_warning)
+                                } else {
+                                    resp
+                                };
+                                changed |= resp.changed();
+                            }
+                        });
+                    });
+                    if s.enhance.backend != EnhanceBackend::Off {
+                        let q = |m: NrPreset| match m {
+                            NrPreset::Auto => t.auto,
+                            NrPreset::Quality => t.quality_high,
+                            NrPreset::Performance => t.quality_low,
+                        };
+                        row(ui, t.nr_model, None, |ui| {
+                            egui::ComboBox::from_id_salt("nr_preset").selected_text(q(s.enhance.nr_preset)).show_ui(ui, |ui| {
+                                for m in [NrPreset::Auto, NrPreset::Quality, NrPreset::Performance] {
+                                    changed |= ui.selectable_value(&mut s.enhance.nr_preset, m, q(m)).changed();
+                                }
+                            });
+                        });
+                        let style = |m: NrStyle| match m {
+                            NrStyle::Default => t.nr_style_default,
+                            NrStyle::Natural => t.nr_style_natural,
+                            NrStyle::Cinematic => t.nr_style_cinematic,
+                        };
+                        row(ui, t.nr_style, None, |ui| {
+                            egui::ComboBox::from_id_salt("nr_style").selected_text(style(s.enhance.nr_style)).show_ui(ui, |ui| {
+                                for m in [NrStyle::Default, NrStyle::Natural, NrStyle::Cinematic] {
+                                    changed |= ui.selectable_value(&mut s.enhance.nr_style, m, style(m)).changed();
+                                }
+                            });
+                        });
+                        row(ui, t.nr_intensity, None, |ui| {
+                            changed |= ui.add(egui::Slider::new(&mut s.enhance.nr_intensity, 0.0..=2.0).fixed_decimals(2)).changed();
+                        });
+                        row(ui, t.nr_strength, Some(t.nr_strength_hint), |ui| {
+                            changed |= ui.add(egui::Slider::new(&mut s.enhance.nr_strength, 0.0..=1.5).fixed_decimals(2)).changed();
+                        });
+                        let detail = if v.enhance == BackendStatus::Off { "" } else { t.enhance_order };
+                        row(ui, t.status, None, |ui| ui.label(format!("{}\n{detail}", status_label(t, v.enhance))));
+                    }
+                });
+                if s.enhance.backend != EnhanceBackend::Off {
+                    egui::CollapsingHeader::new(t.nr_advanced).default_open(false).show(ui, |ui| {
+                        grid("nr_advanced").show(ui, |ui| {
+                            row(ui, t.nr_local_structure, None, |ui| {
+                                changed |= ui.add(egui::Slider::new(&mut s.enhance.nr_local_structure, 0.0..=2.0).fixed_decimals(2)).changed();
+                            });
+                            row(ui, t.nr_local_tone, None, |ui| {
+                                changed |= ui.add(egui::Slider::new(&mut s.enhance.nr_local_tone, 0.0..=2.0).fixed_decimals(2)).changed();
+                            });
+                            row(ui, t.nr_skin_structure, None, |ui| {
+                                changed |= ui.add(egui::Slider::new(&mut s.enhance.nr_skin_structure, 0.0..=1.0).fixed_decimals(2)).changed();
+                            });
+                            row(ui, t.nr_auto_mask, None, |ui| {
+                                changed |= ui.checkbox(&mut s.enhance.nr_auto_mask, "").changed();
+                            });
+                            row(ui, t.nr_ui_correction, None, |ui| {
+                                changed |= ui.checkbox(&mut s.enhance.nr_ui_correction, "").changed();
+                            });
+                        });
+                    });
+                }
             });
 
             egui::CollapsingHeader::new(t.interpolation).default_open(true).show(ui, |ui| {
@@ -434,6 +513,9 @@ pub fn draw(ctx: &egui::Context, s: &mut Settings, v: &UiView<'_>) -> Vec<Action
                 st.present_jitter_ms.map_or_else(|| "—".to_string(), |j| format!("{j:.2} ms")),
                 v.adapter
             ));
+            if st.enhance_gpu_ms > 0.0 {
+                ui.monospace(format!("{} {:5.2} ms", t.stats_enhance_gpu, st.enhance_gpu_ms));
+            }
             // Attribution required by the NVIDIA SDK licenses.
             ui.small(t.credits);
         });

@@ -3,216 +3,30 @@
 低延迟采集卡播放器：**PS5 / 游戏机 → HDMI 采集卡 → PC → 实时补帧 → 原生 HDR 输出**。
 Rust + Direct3D 12，单进程、单交换链，Windows 10/11。
 
-> 状态：技术预览（0.1.0）。核心链路已在真机上验证；本文档同时作为技术报告。
+> 技术预览（0.1.0）。
 
 ---
 
-## 1. 目标与结论
+## 一、功能介绍
 
-| 目标 | 做法 | 实测（RTX 4090，AVerMedia LGU 2.1，PS5 30 fps 游戏） |
-|---|---|---|
-| 低延迟 | 事件驱动节奏、单次拷贝采集、可等待交换链 MaxFrameLatency=1 | 到达→呈现 ≈ **15.3 ms**（30→60 理论下限 16.7 ms 的半帧） |
-| 高效补帧 | 先去重找回真实 30 fps，再用 NVIDIA VFG（AI）插值 | 每帧插值 GPU：VFG 均衡 **1.80 ms**（1440p） |
-| 原生 HDR | 固定 FP16 scRGB 交换链 + 每次 Resize 后重设输出合约 | 全屏/窗口反复切换 HDR 不丢失 |
-| 工程治理 | 6 个职责单一的 crate，纯逻辑全部单元测试，clippy 零警告 | 42 个单元测试 |
-| 可选增强 | `Enhancer` 扩展点（色彩转换后、补帧前） | 预留给官方 SDK（如 DLSS 神经渲染公开后） |
+### 1.1 概述
 
-## 2. 架构
+CapturePlay 把采集卡当作显示器：主机画面在 PC 上以尽可能低的延迟呈现，并按显示器刷新率补帧、上采样和输出 HDR。它不录制、不转码，整条链路只有一个进程和一条交换链。
 
-```
- 采集线程 (MF 异步)                   渲染线程 (D3D12 + egui)                 主线程 (winit)
- ───────────────────                 ─────────────────────────────          ─────────────
- IMFSourceReader ──memcpy──▶ UploadRing ──▶ 去重(Cadence) ──▶ ConvertPass(YUV→线性 scRGB)
-   (一次拷贝, 指纹)        (持久映射上传堆)                         │
-                                                              Enhancer (预留)
-                                                                    │
-                                 Pacer(事件驱动) ──▶ Interpolator(VFG) ──▶ OutputPass
-                                                                    (缩放+色调映射)
-                                                                          │
- WASAPI 采集 ──SPSC 环形缓冲──▶ WASAPI 输出                       EguiPass ──▶ FP16 scRGB 交换链
-   (漂移校正 ±0.5%)                                                 (UI 画在同一后缓冲)
-```
+### 1.2 功能
 
-| crate | 职责 |
+| 功能 | 说明 |
 |---|---|
-| `cp-core` | 纯逻辑：色彩数学、格式选择、去重/节奏、设置。无 OS 依赖，着色器数学的参考实现与测试 |
-| `cp-capture` | Media Foundation 采集：设备枚举、格式选择、异步读取、色彩识别、厂商控制 |
-| `cp-audio` | WASAPI 音频直通、采集卡端点匹配、时钟漂移校正 |
-| `cp-render` | D3D12：上传、转换、补帧后端、输出映射、交换链/HDR、egui 渲染、GPU 计时 |
-| `cp-nvidia` | NVIDIA 运行时的动态绑定：CUDA driver 子集、Video Effects (VFG) |
-| `capture-play` | 应用：窗口、线程编排、UI（中/英）、设置持久化 |
+| 低延迟预览 | 到达→呈现约 15 ms（30→60 内容，RTX 4090） |
+| AI 补帧 | NVIDIA VFG，30/40/50/60 fps 内容补到显示器刷新率，2×/3×/4× |
+| 原生 HDR | 固定 FP16 scRGB 交换链，全屏/窗口切换保持 HDR |
+| AI 超分 | NVIDIA RTX VSR，1440p→4K，可回退 Catmull-Rom |
+| NR 画面增强 | DLSS Neural Rendering，3 种风格与多项参数，实验功能 |
+| 可变刷新 | G-SYNC / FreeSync / HDMI VRR，自动识别固定刷新与 VRR |
+| 音频直通 | 采集卡 HDMI 音频经 WASAPI 输出，带时钟漂移校正 |
+| 界面 | 中文/英文，HDR 后缓冲内绘制，可显示 GPU 耗时与呈现抖动 |
 
-线程模型：主线程只跑窗口消息；渲染线程拥有设备、交换链、采集会话与 UI。窗口拖动/缩放的模态循环不会阻塞画面；渲染线程在一个事件 + 高精度可等待定时器上休眠，按节奏器给出的截止时间唤醒（普通超时有 15.6 ms 系统时钟粒度，实测会丢帧）。
-
-## 3. 低延迟设计
-
-### 3.1 采集
-- Media Foundation `IMFSourceReader` 异步模式，`MF_LOW_LATENCY`、禁用格式转换器、驱动队列深度 2。
-- 每帧只做**一次拷贝**：驱动缓冲 → 持久映射的 D3D12 上传堆（行距按 D3D12 对齐），随后 GPU `CopyTextureRegion` 到平面纹理。
-- 拷贝时顺便采样 64×36 亮度指纹用于去重，几微秒。
-- 渲染端来不及时，采集端回收**最旧**的未消费帧，而不是丢弃最新帧，延迟不会累积。
-- 停止采集不依赖驱动返回（异步回调 + 50 ms 轮询），无信号时也能干净退出。
-
-### 3.2 去重：找回游戏真实帧率
-主机 30 fps 游戏仍以 60 Hz HDMI 输出，每个游戏帧出现两次（或不均匀的 3:1）。在重复帧之间插值没有意义，并会让补帧节奏错乱。`CadenceTracker` 用指纹差（均值 + 变化像素比例，容忍采集噪声）判断唯一帧，并用均值估计内容帧间隔（不用中位数：42 fps 游戏在 60 Hz 信号上是 16.7/33.3 ms 交替，中位数会误读为 60 fps，导致 33 ms 间隔被当成卡顿而不插值）；长时间静止（菜单）不污染估计。
-
-### 3.3 源帧时间重建（可变帧率游戏）
-实测：PS5 开 VRR、游戏约 42 fps 时，LGU 2.1 输出仍是**固定 60 Hz**（间隔 100% 为 16.7 ms），唯一帧间隔是不规则的 16.7/33.3 ms 交替——采集卡把 VRR 时序量化掉了。调研结论（AVerMedia 产品页/手册、Elgato 同类实测）：这类卡的“VRR 录制”都是把 VRR 输入装进固定帧率流，没有公开接口给出逐帧时间；社区方案也只是丢重复帧做 VFR。
-
-但量化仍限定了真值：在 `obs` 首次出现的帧，真实完成时间落在 `(obs − 信号周期, obs]`。`Retimer`（`cp_core::retime`）在最近 24 帧上取所有帧对允许的斜率区间中点作为帧间隔，再取满足全部约束的**最晚**直线（延迟最小）；拟合不了（帧时间真的在变）就缩短窗口，最差退回观测值。仿真（42/45/50 fps 量化到 60 Hz）：间隔离散度从 16.7 ms 降到 1.3–2.6 ms；30/60 fps 锁帧内容结果与观测完全一致（零额外延迟），可变帧率平均多等约 5 ms。UI 可关闭。
-
-更细的量化需要更高的信号频率：该卡支持 **1080p120 P010**（HDR），量化误差减半（8.3 ms），再用 VSR 2× 到 4K。
-
-### 3.4 事件驱动节奏（插值的延迟下限）
-插值 A、B 之间的帧必须等 B 到达。`Pacer` 按 B 的（重建）内容时间排程 `M-1` 个中间帧，间隔 `interval/M`，B 最后显示：
-
-- 附加延迟 = `(M-1)/M × 源帧间隔`。30→60（M=2）为 **半帧 16.7 ms**，这是插值的理论下限。
-- 更高倍数延迟递增（4× 为 25 ms），因此默认 2×，UI 可选 3×/4×。
-- 超过内容间隔 1.75 倍的空档（加载、卡顿）不插值，直接显示真实帧。
-- 引擎外接的 DLSS-FG 一类方案通常在此之上还要多排队一帧以上，这是本项目不采用它的原因之一。
-- 排程基于采集时钟而非到达时刻：首个槽位 = 内容时间 + 偏移，偏移 = 处理预算（近 90 帧 `就绪 − 内容时间` 的 p95）+ 合成提前量。偏移需要变大时立即上调（不晚显示），变小时按 1/32 指数回落，避免相邻两对帧的交界间隔跳动。USB 到达抖动与处理抖动因此不会传到屏幕上。
-
-### 3.5 呈现与 VRR
-FLIP_DISCARD、3 缓冲、`SetMaximumFrameLatency(1)`、可等待对象在录制前尽量晚地等待；关闭垂直同步时允许 tearing。
-
-槽位的目标时间是**上屏时间**：
-- **可变刷新（G-SYNC/FreeSync/HDMI VRR）**：帧在 Present 时即显示，因此渲染线程提前一个合成量唤醒、录制提交，再用高精度定时器 + 短自旋**精确在目标时刻 Present**（以前会提前最多半个刷新周期，在 VRR 上直接变成 2 ms 抖动）。任何倍数都可用（240 Hz 上 42 fps × 3 ≈ 126 fps）。
-- **固定刷新**：目标对齐 vblank 网格，并只用步长为整数个刷新周期的倍数（240 Hz 上 30 fps 用 2×/4×，3× 会 8.3/12.5 ms 交替）。
-- **自动检测**：用 `GetFrameStatistics`（`PresentRefreshCount` 换算到该帧实际上屏的 vblank）比对目标与实际：不在网格上的目标若仍被吸附到网格 → 固定刷新，否则 → VRR。实测 RTX 4090 + 240 Hz 显示器无边框全屏为 VRR。UI 可强制模式，并显示呈现抖动（实际−目标偏差的 p95）。
-- 等待 Present 时刻期间可被新采集帧唤醒：摄入（转换录制与提交，< 1 ms）立即进行，新帧不必等这次 Present。
-- 超分在插帧之后、对每个要呈现的帧进行（见 6.3），在 GPU 队列上按序执行，不在摄入链路上；合成提前量相应包含 VSR 的 GPU 时间。
-
-实测（PS5 ~42 fps，1440p60 P010，240 Hz VRR）：VFG 3× 输出约 126 fps，大多数帧实际上屏间隔与目标相差 < 0.5 ms；到达→呈现延迟约 25–37 ms（含 3× 的 2/3 源帧间隔 ≈ 16 ms 与重建等待）。3× + 后置 RTX VSR（NGX）：约 130 fps，延迟 21–32 ms。
-
-## 4. HDR 方案
-
-**工作空间**：线性 scRGB（BT.709 原色，1.0 = 80 nit，FP16，可存负值即广色域）。
-
-**输入解码**（`convert.hlsl`，数学在 `cp-core::color` 中有单元测试）：
-- YUV→RGB 仿射矩阵在 CPU 端按矩阵/量化范围/位深/存储位宽合成（P010 的 10-bit 码值位于 16-bit 高位）。
-- PQ → 绝对亮度；HLG → 逆 OETF + 按显示器峰值的 BT.2100 OOTF；SDR → sRGB/γ2.2/BT.1886 × SDR 参考白。
-- BT.2020 → BT.709 矩阵转换（保留负值）。
-
-**色彩识别**：优先级为 用户覆盖 > 驱动显式 HDR 标记 > 10-bit 启发式 > 驱动标记 > 分辨率默认。
-采集卡普遍把 HDR 的 P010 错标为 BT.709（LGU 2.1 即如此）；主机只有在 HDR 开启时才输出 10-bit，因此 10-bit 无标记默认按 HDR10 处理（可关闭）。
-
-**输出**：交换链**固定**为 `R16G16B16A16_FLOAT` + `G10_NONE_P709`。DWM 在 SDR 与 HDR 显示器上都能正确合成，跨显示器移动或切换 Windows HDR 时只改输出着色器常量，不重建交换链：
-- HDR 显示器：按 BT.2390 EETF 在 PQ 域做保色相的色调映射到显示器峰值（`IDXGIOutput6::GetDesc1`）。
-- SDR 显示器：映射到 SDR 白并按 SDR 白归一。
-- SDR 内容放在 Windows「SDR 内容亮度」对应的参考白（`DISPLAYCONFIG_SDR_WHITE_LEVEL`），UI 同样按此白点绘制。
-
-**参考项目“全屏后 HDR 丢失”的根因与修复**：参考实现只在创建交换链时调用一次 `SetColorSpace1`，全屏触发的 `ResizeBuffers` 之后从未重设；它的视频窗口还是嵌入 Qt 的子 HWND、跨线程呈现。本项目：
-1. `Presenter::apply_output_contract()` 幂等，在创建与**每次** `ResizeBuffers` 后执行（色彩空间 + 清除 HDR10 元数据）。
-2. 全屏只用无边框（禁止 DXGI 独占与 Alt+Enter）。
-3. 显示器信息按「窗口重叠面积最大的输出」查询；`IDXGIFactory::IsCurrent()` 失效、窗口移动/缩放时重新查询；查询失败保留上次结果，绝不误降级到 SDR。
-4. UI 与视频在同一后缓冲，不存在子窗口/空域问题。
-
-已实测：4K 全屏 ↔ 窗口多次切换，每次 Resize 后都重新应用输出合约，显示器保持 HDR，补帧节奏不中断。
-
-## 5. 补帧：NVIDIA Video Frame Generation（`interp_vfg`，RTX 40/50，AI 模型）
-
-- 帧直接编码进 D3D12 与 CUDA 共享的缓冲区（`D3D12_HEAP_FLAG_SHARED` → `cuImportExternalMemory`），RGB10A2：HDR 内容用 PQ/BT.2020，SDR 内容用 sRGB。
-- 同步：D3D12 队列 Signal(producer) → CUDA 流 Wait → `NvVFX_Run` → CUDA Signal(completion) → D3D12 队列 Wait。全程无 CPU 拷贝、无 CPU 等待。
-- 使用 `Timestep` 模式，任意 t 都可生成，与节奏器的时间模型一致。
-- 关闭 SDK 自带镜头切换检测（会让每次 Run 产生 CPU 同步）。
-- 运行时 DLL 不在仓库中，见 `runtime/README.md`。
-- 插值后端通过 `Interpolator` trait 接入，可再扩展。
-
-### 5.1 性能（30→60，同一游戏画面，release，RTX 4090）
-
-| 模型 | 1440p P010 每帧 GPU | 4K NV12 每帧 GPU | 到达→呈现 |
-|---|---|---|---|
-| 快速 | 0.95 ms | — | ≈15.3 ms |
-| 均衡（默认） | 1.80 ms | 2.12 ms | ≈15.4 ms |
-| 高质量 | 8.29 ms | — | ≈16.0 ms |
-
-GPU 时间用时间戳查询测量，包含 CUDA 跨引擎部分。UI 提供 **定格插值帧**（P 键）用于检查伪影。
-
-### 5.2 画质：真值测试与“为什么不用 NVIDIA Optical Flow”
-
-`cargo test -p cp-render -- --ignored --nocapture` 运行 GPU 真值测试：用可在连续坐标上求值的合成纹理生成 A/B 两帧（运动精确已知），把插值帧与 t=0.5 的真值比较（PSNR，越高越好），重点看**遮挡区**（运动物体边缘，重影出现的地方）。
-
-早期版本另有一个 NVIDIA Optical Flow（NVOFA 硬件光流 + 自写 warp）后端。真值测试表明光流本身精确（已知平移 (40,−20) 测得 (40.000, −20.000)），但块匹配光流在物体边界天然模糊：
-
-| 方案（1440p，物体移动 (60,20)） | 物体边缘带 PSNR |
-|---|---|
-| 两帧直接混合 | 16.4 dB |
-| 光流 + 反向 warp | 18.9 dB |
-| 光流 + 前向投影（遮挡感知） | 22.3 dB |
-| VFG 快速 / 均衡 / 高质量 | 26.1 / 27.8 / 32.6 dB |
-
-即使改为遮挡感知的前向投影，光流方案在边缘仍比 VFG 均衡低约 6 dB，GPU 耗时却相近，因此被移除。测试也定位并修复了它的一个崩溃：注册给 NVOFA 的资源在 `nvOFDestroy` 之后释放会访问冲突（运行中切换后端时闪退）。
-
-## 6. 上采样调研：1440p HDR → 4K
-
-**背景**：本机采集卡（LGU 2.1）在 60 Hz 下支持 HDR（P010）的最高分辨率是 1440p，4K 显示需要上采样。采集画面没有游戏引擎提供的运动向量、深度和亚像素抖动。
-
-### 6.1 候选方案
-
-| 方案 | 类型 | 是否适合采集画面 | 集成/许可 |
-|---|---|---|---|
-| **NVIDIA RTX Video Super Resolution**（模型 `nvngx_vsr.dll`） | AI 空间超分 + 压缩伪影修复 | ✅ 为视频设计，逐帧、无需运动向量 | **采用**：RTX Video SDK（NGX）在 D3D12 上调用，见 6.3。早期经 Video Effects SDK `VideoSuperRes` 接入，有一帧滞后，已弃用（6.2 第 4 点） |
-| DLSS SR（Transformer） | 游戏时序超分 | ❌ 依赖引擎运动向量/深度/抖动；采集画面只能喂零或光流（光流在边界不可靠，见 5.2） | 不面向视频 |
-| FSR 1 / NIS | 传统空间超分 + 锐化 | ✅ | MIT 着色器，可作非 NVIDIA 备选 |
-| Catmull-Rom | 插值缩放 | ✅ | 已实现（PQ 感知域，作为 VSR 备选） |
-
-### 6.2 真值测试（真实游戏画面）
-
-方法（`crates/cp-render/src/upscale_bench.rs`）：用采集卡抓取 PS5《战神：诸神黄昏》**原生 4K HDR** 帧（4K30 P010），在线性光下面积平均缩到 1440p，再由各方案放大回 4K，与原图在 **PQ 感知域**比较 PSNR。VSR 走与应用相同的完整路径（编码 → NGX → 解码）；耗时为 RTX 4090 上 1440p→4K 单帧 GPU 时间，含编解码。
-
-| 方案 | PSNR | 耗时 |
-|---|---|---|
-| 双线性（线性光） | 30.77 dB | — |
-| Catmull-Rom（线性光） | 31.49 dB | ~0.1 ms |
-| Lanczos3（线性光） | 31.27 dB | — |
-| Catmull-Rom（PQ 域，备选路径） | 32.68 dB | ~0.1 ms |
-| RTX VSR Bicubic（非 AI） | 32.69 dB | 0.30 ms |
-| RTX VSR Low / Medium | 32.65 / 32.53 dB | 1.18 / 1.53 ms |
-| **RTX VSR High** | **32.88 dB** | 3.61 ms |
-| RTX VSR Ultra | 32.60 dB | 4.94 ms |
-
-结论：
-1. **10-bit 输入应使用 PQ 编码**：同样的模型喂“0–1000 nit 的 sRGB 曲线”编码，各档低 1–3 dB。SDK 文档称 VSR 面向 SDR，但 PQ 编码的 HDR10 作为 10-bit 信号送入效果最好。
-2. VSR High 比 Catmull-Rom 高约 1.4 dB，视觉上叶脉、苔藓等高频细节明显更清晰；Ultra 档在这类干净的游戏画面上没有收益。
-3. PSNR 增益的相当一部分来自“在感知域（PQ）而非线性光中插值”，Catmull-Rom 已据此改为 PQ 域。
-4. **Video Effects SDK 路径的一帧滞后**（已弃用）：`NvVFX_Run` 写出的是*最近一次完成*的结果并把新输入排队，单次调用得到的是上一帧（与档位、CUDA 流、async 标志无关，首次调用输出为空）；其计算在 SDK 内部流上，完成 fence 也不按流排序（0.70 ms 触发、3.90 ms 才算完）。要拿到本帧只能“运行 → `cuCtxSynchronize` → 再运行”，GPU 时间翻倍，且需 CPU 同步。慢速平移测试 `slow_pan_temporal_stability`（每帧平移 0.6 个 4K 像素）量化了它：单次运行时输出与*上一帧*真值吻合（32.5–33 dB）、与本帧只有 30.9 dB——表现为开超分后慢速转视角抖动。NGX D3D12 路径单次调用即与本帧对齐，该测试作为回归保护（所有档位须与本帧对齐）。对齐后 VSR 的时间稳定性与 Catmull-Rom 相当（36.1–36.4 vs 36.0 dB），模型本身不闪烁。
-
-### 6.3 实现（RTX Video SDK，NGX D3D12）
-- `cp_nvidia::ngx`：依据公开头文件手写的 FFI（`NVSDK_NGX_D3D12_Init/CreateFeature/EvaluateFeature_C`、参数 setter），进程内初始化一次，所有调用串行化（NGX 非线程安全）。SDK 静态库 `nvsdk_ngx_d.lib` 构建时存在才链接（`cfg(ngx)`），否则该后端不编译。
-- `cp_render::NgxVsrUpscaler`：编码（FP16 线性 scRGB → PQ BT.2020 `R10G10B10A2_UNORM` 纹理）→ VSR → 解码，**全部录在帧自己的命令列表里**，与插帧、输出在同一队列上按序执行；无 CUDA 互操作、无 CPU 等待。VSR 特性（模型）在后台线程创建一次（约 2.6 s），尺寸与档位是每次调用的参数，窗口改尺寸不重建。
-- 管线：采集 1440p → 转换 → VFG（1440p）→ **VSR → 4K** → 输出。超分**后置**：对每个呈现的帧各做一次，同一帧重复呈现（UI 刷新、定格）复用结果；摄入链路上只有转换。VSR 的 GPU 时间单独计时并计入合成提前量。
-- 目标尺寸：按显示区域选 VSR 支持的最小覆盖倍数（4/3、1.5、2、3、4×，`cp_core::scale`）；窗口尺寸变化 300 ms 去抖，画面不大于窗口时不超分。
-- **“Artifact Reduction”不是独立功能**：SDK 中它是 VSR 的组成部分（“Upscale SDR Surface with Artifact Reduction”），无单独参数，针对视频压缩伪影；后置超分时已作用于每个呈现帧。NGX 也接受 1:1（不放大）调用，但真值测试 `vsr_on_interpolated_frame` 表明它**不能修复插帧伪影**：VFG 中间帧与真实帧的差距经 1:1 VSR（两者都处理）后从 47.05 dB 变为 44.9 dB（均衡档），即增强把插值误差一并放大。因此不为插帧额外启用。插帧伪影的有效手段是 VFG 档位（边缘 PSNR 低/中/高 26.1 / 27.8 / 32.6 dB，见 5.2），受单帧预算约束。
-- 同一时刻只建一个 VSR 特性实例：测试中同时创建 5 个时后续实例未能就绪；应用切换档位时先释放旧实例再加载新实例。
-- 实测（PS5 ~42 fps，1440p60 P010 → 4K，VFG 3×，240 Hz VRR）：VSR Medium 约 1.35 ms/帧，输出约 130 fps，延迟 21–32 ms，呈现抖动 p95 1.3–2.6 ms。
-- **单帧预算**：每个输出帧的 GPU 工作（插帧 + 超分 + 输出）须小于输出帧间隔（42 fps 内容：2× 11.9 ms、3× 7.9 ms）。高档位明显更贵：VFG（1440p）低/中/高 0.52 / 1.67 / **7.44 ms**，VSR 低/中/高/极致 1.16 / 1.48 / 3.67 / 5.26 ms。VFG 高 + 3× 已超出预算，会晚帧抖动。
-- 备选：VSR 关闭或不可用时，输出阶段用 **PQ 感知域 Catmull-Rom**。
-- 许可：RTX Video SDK 受 NVIDIA RTX SDKs License 约束（不进仓库、随应用以目标代码分发、应用内署名、商业发布前通知 NVIDIA），见 `runtime/README.md` 与第 12 节。
-
-## 7. 音频
-
-采集卡 HDMI 音频是普通 WASAPI 采集端点，按产品名与视频设备自动配对；不会回退到无关输入（避免误播麦克风）。两条事件驱动线程（MMCSS Pro Audio）经无锁 SPSC 环形缓冲连接；输出端以采集格式初始化，交给 Windows 转换（`AUTOCONVERTPCM`）。两个设备时钟的漂移由 ±0.5% 的线性重采样吸收，比例由缓冲水位的慢速控制器决定（有仿真测试），延迟目标默认 30 ms，可调音画偏移。
-
-## 8. 采集卡建议（以 AVerMedia Live Gamer Ultra 2.1 为例）
-
-| 模式 | 结论 |
-|---|---|
-| **1440p60 P010** | HDR 首选。完整看到 60 Hz 信号，去重准确；每帧约 11 MB，USB 传输短 |
-| 4K60 NV12 | 8-bit，HDR 会被转成 SDR |
-| 4K30 P010 | 不推荐：60 Hz 信号被隔帧采样，可能取到重复帧（实测偶发唯一帧 28.4/s → 顿挫），也可能取到较晚的那份副本；每帧约 25 MB，USB 传输更久 |
-
-该卡（USB 版）不支持 AVerMedia 硬件色调映射属性集，HDR 直通无需设置；PCIe 型号会自动关闭硬件色调映射。
-
-## 9. 构建与运行
-
-需求：Windows 10/11 x64，Rust 1.95+（MSVC 工具链），Windows SDK（`dxc.exe`，构建时编译 HLSL 为签名 DXIL；可用 `DXC_PATH` 指定），D3D12 显卡；补帧需要 NVIDIA RTX 40/50 显卡与 VFG 运行时；超分需要 NVIDIA RTX 显卡，并在**构建前**把 RTX Video SDK 解压到 `runtime/rtx-video-sdk/`（未找到时照常构建，只是没有 AI 超分）。
-
-```powershell
-cargo build --release
-.\target\release\capture-play.exe
-```
-
-可选的 NVIDIA 组件放到 `runtime/`（git 忽略）：Video Effects 运行时（VFG）放 `runtime/nvidia-vfx/`，RTX Video SDK（VSR）放 `runtime/rtx-video-sdk/`，详见 `runtime/README.md`。
+### 1.3 使用
 
 | 操作 | 快捷键 |
 |---|---|
@@ -221,35 +35,195 @@ cargo build --release
 | 退出全屏 | Esc |
 | 定格插值帧 | P |
 
-鼠标在画面上静止 2 秒后自动隐藏（悬停在面板上时不隐藏），移动即恢复。
+鼠标在画面上静止 2 秒后自动隐藏（悬停在面板上时除外）。
 
-设置保存在 `%APPDATA%\CapturePlay\settings.toml`，日志在同目录 `capture-play.log`（`CAPTUREPLAY_LOG=debug` 提高级别，`CAPTUREPLAY_D3D_DEBUG=1` 启用 D3D12 调试层）。UI 支持中文/英文，默认跟随系统语言。
+设置保存在 `%APPDATA%\CapturePlay\settings.toml`，日志为同目录的 `capture-play.log`。`CAPTUREPLAY_LOG=debug` 提高日志级别，`CAPTUREPLAY_D3D_DEBUG=1` 启用 D3D12 调试层。
 
-## 10. 相对参考项目（Veyra-NRVideo）的取舍
+NR 面板：后端、模型（Auto / Quality / Performance）、风格（默认 / 自然 / 电影）、模型强度、合成强度；“更多参数”中可调局部结构、局部影调、肤色结构、自动蒙版与 UI 校正。
 
-| 方面 | 参考项目 | 本项目 |
+### 1.4 性能参考
+
+RTX 4090，AVerMedia Live Gamer Ultra 2.1，1440p P010，release 构建：
+
+| 补帧模型 | 每帧 GPU | 到达→呈现 |
 |---|---|---|
-| 规模/结构 | 约 4 万行 C++，多个 3000–9000 行的单文件 | 约 1.1 万行 Rust + 500 行 HLSL，6 个职责单一的 crate |
-| UI | Qt QML + 嵌入的原生子窗口（空域、跨线程呈现） | egui 直接画进 HDR 后缓冲 |
-| 采集 | DirectShow + 自写 COM 滤镜 | Media Foundation 异步读取 |
-| 节奏 | 固定前瞻的时间线 | 事件驱动，半帧延迟下限，去重 + 源帧时间重建后插值，VRR 精确呈现 |
-| HDR | 色彩空间只设一次 → 全屏后丢失 | 固定 scRGB + 每次 Resize 重设，显示器状态只升不误降 |
-| 补帧 | 多后端，含针对签名 DLL 的内存补丁/架构伪装 | 只用官方、可正常加载的运行时（NVIDIA VFG），画质用真值测试量化 |
-| DLSS 5 NR | 依赖未公开功能与对 NVIDIA 访问限制的规避 | 不实现；保留 `Enhancer` 接口等待官方 SDK |
+| 快速 | 0.95 ms | ≈15.3 ms |
+| 均衡（默认） | 1.80 ms | ≈15.4 ms |
+| 高质量 | 8.29 ms | ≈16.0 ms |
 
-## 11. 已知限制与后续
+| 项目 | GPU 时间 | 说明 |
+|---|---|---|
+| RTX VSR Medium / High / Ultra | 1.35 / 3.61 / 4.94 ms | High 画质最佳，Ultra 在干净游戏画面上收益很小 |
+| NR（1440p） | ≈5.0 ms / 唯一帧 | 社区 310.9.16，强度 1.0，默认风格 |
 
-- 画质对比需在 HDR 显示器上主观评估；尚无客观指标（可用 60 fps 内容做“隔帧插值 vs 真实帧”的 PSNR/SSIM 评估）。
-- 端到端延迟（含采集卡与显示器）需要光电/高速相机测量；软件内只统计到达→呈现。
-- 尚未实现：设备热插拔通知（目前定时重试）、设备丢失后自动重建、HDR 元数据（InfoFrame）读取、音频设备选择 UI、CI。
-- 镜头切换检测：目前依赖空档判断，场景硬切会生成一帧混合帧。
+以上为特定机器与素材的参考值，实际取决于显卡、采集格式和效果组合。
 
-## 12. 许可证
+### 1.5 采集卡与硬件
 
-本项目以 **GPL-3.0-or-later** 发布，见 [LICENSE](LICENSE)，并附带 GPLv3 第 7 条的**附加许可**，见 [LICENSE-EXCEPTION.md](LICENSE-EXCEPTION.md)：允许与 NVIDIA 专有组件（RTX Video SDK / NGX 库与运行时、Video Effects SDK 运行时、CUDA）链接或组合后分发。**这些专有 SDK 不属于本项目、不受 GPL 约束**，仍按 NVIDIA 各自的许可条款使用，需由使用者自行接受与遵守。
+以 AVerMedia Live Gamer Ultra 2.1 为例：
 
-仓库**不包含**任何专有 SDK、头文件、库或运行时：
-- 随 NVIDIA 显卡驱动提供：`nvcuda.dll`（CUDA driver）。
-- 用户自行获取并放入 git 忽略的 `runtime/`：NVIDIA Video Effects SDK 运行时（VFG）、RTX Video SDK（VSR），见 `runtime/README.md`。
+| 模式 | 建议 |
+|---|---|
+| **1440p60 P010** | HDR 首选，去重准确，USB 带宽压力小 |
+| 4K60 NV12 | 8-bit，HDR 会转成 SDR |
+| 4K30 P010 | 不推荐，60 Hz 信号被隔帧采样，可能出现重复帧与顿挫 |
 
-CUDA 的 FFI 声明依据 NVIDIA 公开的头文件与文档手写。
+该卡（USB 版）不需要设置硬件色调映射；PCIe 型号会自动关闭。
+
+| 功能 | 要求 |
+|---|---|
+| 基础播放 | Windows 10/11 x64，D3D12 显卡 |
+| VFG 补帧 | NVIDIA RTX 40/50 + Video Effects 运行时 |
+| VSR 超分 | NVIDIA RTX 20+ + RTX Video SDK |
+| NR 官方（RTX50） | 驱动/NGX 暴露 feature 18 |
+| NR 社区（Unofficial RTX40/30/20） | 自备社区 `nvngx_dlssnr.dll` + 本项目生成的 `captureplay_nvngx.dll` |
+
+### 1.6 构建与运行
+
+需求：Rust 1.95+（MSVC）、Windows SDK（`dxc.exe`，可用 `DXC_PATH` 指定）、D3D12 显卡。
+
+~~~powershell
+cargo build --release
+.\target\release\capture-play.exe
+~~~
+
+可选组件放在 `runtime/`（git 忽略）：
+- `runtime/nvidia-vfx/`：VFG 运行时；
+- `runtime/rtx-video-sdk/`：RTX Video SDK（构建时链接 `nvsdk_ngx_d.lib`，运行时加载 `nvngx_vsr.dll`）；
+- `runtime/nvidia-nr/`：社区 `nvngx_dlssnr.dll` 与 `captureplay_nvngx.dll`。
+
+`cargo build` 会同时生成 `captureplay_nvngx.dll`。首次启用 VSR/NR 时模型创建约 2–3 秒，期间画面直通。
+
+### 1.7 注意事项
+
+- HDR 需要显示器与 Windows HDR 同时开启；切换全屏或窗口后交换链会重新应用输出合约。
+- NR 为实验功能；社区运行库未签名、可能崩溃，仅用于学习交流。官方路径取决于 NVIDIA 是否在驱动中开放 feature 18。
+- 若 UI 报告“固定刷新”而显示器支持 VRR，先关闭 NVIDIA 或第三方叠加层再测。
+
+---
+
+## 二、技术实现
+
+### 2.1 架构与线程
+
+~~~
+ 采集线程 (MF 异步)                   渲染线程 (D3D12 + egui)                 主线程 (winit)
+ ───────────────────                 ─────────────────────────────          ─────────────
+ IMFSourceReader ──memcpy──▶ UploadRing ──▶ 去重(Cadence) ──▶ ConvertPass(YUV→线性 scRGB)
+   (一次拷贝, 指纹)        (持久映射上传堆)                         │
+                                                               NR (可选)
+                                                                     │
+                                 Pacer(事件驱动) ──▶ Interpolator(VFG) ──▶ OutputPass
+                                                                    (缩放+色调映射)
+                                                                          │
+ WASAPI 采集 ──SPSC 环形缓冲──▶ WASAPI 输出                       EguiPass ──▶ FP16 scRGB 交换链
+   (漂移校正 ±0.5%)                                                 (UI 画在同一后缓冲)
+~~~
+
+| crate | 职责 |
+|---|---|
+| `cp-core` | 色彩数学、格式选择、去重/节奏、设置 |
+| `cp-capture` | Media Foundation 采集：设备、格式、异步读取、色彩识别 |
+| `cp-audio` | WASAPI 音频直通、端点匹配、时钟漂移校正 |
+| `cp-render` | D3D12：上传、转换、NR、补帧、超分、输出、交换链/HDR、egui |
+| `cp-nvidia` | CUDA driver 子集、Video Effects (VFG)、NGX（VSR/NR） |
+| `nr-bridge` | 社区 `nvngx_dlssnr.dll` 的转发宿主 `captureplay_nvngx.dll` |
+| `capture-play` | 窗口、线程编排、UI、设置持久化 |
+
+主线程只跑窗口消息；渲染线程拥有设备、交换链、采集会话与 UI。渲染线程按节奏器给出的截止时间休眠/唤醒，窗口拖动或缩放不会阻塞画面。
+
+### 2.2 采集与色彩
+
+- Media Foundation `IMFSourceReader` 异步模式，`MF_LOW_LATENCY`，禁用格式转换器，驱动队列深度 2。
+- 每帧一次拷贝：驱动缓冲 → 持久映射的 D3D12 上传堆 → GPU 拷贝到平面纹理；拷贝时采样 64×36 亮度指纹。
+- 渲染来不及时回收最旧的未消费帧，延迟不累积。
+- 色彩空间为线性 scRGB（BT.709 原色，1.0 = 80 nit，FP16）。
+- YUV→RGB 矩阵在 CPU 端按矩阵、量化范围、位深合成；PQ/HLG/SDR 分别解码为绝对亮度或参考白。
+- 色彩识别优先级：用户覆盖 > 驱动 HDR 标记 > 10-bit 启发式 > 驱动标记 > 分辨率默认。
+
+### 2.3 去重与重定时
+
+- 主机 30 fps 游戏在 60 Hz 输出中每帧出现两次；在重复帧之间插值没有意义。`CadenceTracker` 用指纹差判断唯一帧，并估计内容帧间隔。
+- 采集卡会把 VRR 输入量化成固定 60 Hz，唯一帧间隔呈 16.7/33.3 ms 交替。`Retimer` 在最近 24 帧上取满足量化约束的最晚直线，重建均匀的内容时间；锁帧内容不受影响，可变帧率平均多等约 5 ms。
+
+### 2.4 节奏与呈现
+
+- `Pacer` 按下一帧的内容时间排程 `M-1` 个中间帧，附加延迟为 `(M-1)/M × 源帧间隔`：30→60 为半帧 16.7 ms，是插值的理论下限；默认 2×，可选 3×/4×。
+- 超过内容间隔 1.75 倍的空档不插值，直接显示真实帧。
+- 首个槽位 = 内容时间 + 偏移；偏移由近期处理预算的 p95 与合成提前量决定，避免到达抖动传到屏幕。
+- 交换链使用 FLIP_DISCARD、3 缓冲、`SetMaximumFrameLatency(1)` 与可等待对象；关闭垂直同步时允许 tearing。
+- VRR 下精确在目标时刻 Present；固定刷新下对齐 vblank 并使用整数刷新周期倍数。`GetFrameStatistics` 用于区分两者并统计呈现抖动。
+- 超分在插帧之后、对每个呈现帧执行，与输出同队列。
+
+### 2.5 HDR 输出
+
+- 交换链固定为 `R16G16B16A16_FLOAT` + `G10_NONE_P709`，跨显示器或切换 Windows HDR 不重建。
+- HDR 显示器按 BT.2390 EETF 在 PQ 域做保色相色调映射；SDR 显示器映射到 SDR 白。
+- UI 与视频画在同一后缓冲，按 Windows「SDR 内容亮度」的参考白绘制。
+- 每次 `ResizeBuffers` 后重新应用色彩空间并清除 HDR10 元数据，全屏/窗口切换不丢失 HDR。
+
+### 2.6 补帧
+
+- 帧编码进 D3D12 与 CUDA 共享缓冲区（RGB10A2；HDR 用 PQ/BT.2020，SDR 用 sRGB），`NvVFX_Run` 以 `Timestep` 模式生成任意 t 的中间帧。
+- D3D12 Signal → CUDA Wait → Run → CUDA Signal → D3D12 Wait，全程无 CPU 拷贝与等待。
+- 补帧后端通过 `Interpolator` trait 接入。
+
+### 2.7 超分
+
+- `cp_nvidia::ngx` 手写 NGX FFI，进程内初始化一次并串行化。
+- `NgxVsrUpscaler` 将 FP16 scRGB 编码为 PQ BT.2020 10-bit，调用 VSR，再解码回工作帧；全部录在帧自己的命令列表里，与补帧、输出同队列。
+- 模型在后台线程创建，尺寸与档位是每次调用的参数；超分后置，对每个呈现帧执行。
+- 目标尺寸按显示区域选 VSR 支持的最小覆盖倍数；窗口变化去抖。VSR 不可用时回退 PQ 感知域 Catmull-Rom。
+
+### 2.8 NR
+
+- 顺序：转换 → NR（每个唯一源帧一次）→ 补帧 → 超分 → 输出。NR 先于补帧与超分，插值帧和超分帧都基于增强后的画面。
+- 数据流：线性帧编码为 sRGB 代理（HDR 使用可逆高光滚降）→ NGX 同分辨率推理（Color / 常量 Depth / 零 MVec / Output）→ 把结果作为有界线性残差叠回原帧。
+- 风格 0/1/2；模型强度、局部结构、局部影调、肤色结构、自动蒙版、UI 校正为逐次评估参数，调整即时生效。模型预设切换会重建特性。
+- 官方路径（RTX50）：直接创建 NGX feature 18，驱动未开放时显示不可用并直通。
+- 社区路径（Unofficial RTX40/30/20）：`captureplay_nvngx.dll` 加载自备的 `nvngx_dlssnr.dll` 并转发 NGX 入口。社区 DLL 未签名、不受支持，仅用于学习交流。
+- 部署：`captureplay_nvngx.dll` 放 exe 同目录或 `runtime/nvidia-nr/`，`nvngx_dlssnr.dll` 放 `runtime/nvidia-nr/`，在 UI 选择社区后端。替换 DLL 后需重启。
+
+### 2.9 音频
+
+采集卡 HDMI 音频作为 WASAPI 采集端点，按产品名与视频设备自动配对。采集与输出两条事件驱动线程通过无锁 SPSC 环形缓冲连接；输出端交给 Windows 转换（`AUTOCONVERTPCM`）。两个设备时钟的漂移由 ±0.5% 的线性重采样吸收，比例由缓冲水位控制，默认 30 ms 缓冲，可调音画偏移。
+
+---
+
+## 三、授权与 SDK
+
+### 3.1 项目许可
+
+本项目以 **GPL-3.0-or-later** 发布，见 `LICENSE`。附加许可见 `LICENSE-EXCEPTION.md`：允许与 NVIDIA 专有组件（RTX Video SDK / NGX、Video Effects SDK、CUDA）链接或组合后分发。这些 SDK 不属于本项目、不受 GPL 约束，按 NVIDIA 各自的许可使用。
+
+### 3.2 NVIDIA SDK 与运行库
+
+| 组件 | 用途 | 获取 | 分发 |
+|---|---|---|---|
+| `nvcuda.dll` | CUDA driver（VFG 互操作） | 随 NVIDIA 驱动 | 不随本项目分发 |
+| Video Effects 运行时（`runtime/nvidia-vfx/`） | VFG 补帧 | 用户从 NVIDIA 获取 | 随应用以目标代码分发，保留通知 |
+| RTX Video SDK（`runtime/rtx-video-sdk/`） | VSR；构建时链接 `nvsdk_ngx_d.lib` | 用户从 NVIDIA 开发者站点获取 | 随应用分发 `nvngx_vsr.dll`，保留通知；商业发布前通知 NVIDIA |
+| NGX feature 18（NR） | DLSS Neural Rendering | 官方或社区运行库，见 3.3 | 本项目不分发 `nvngx_dlssnr.dll` |
+
+找不到 RTX Video SDK 时 `cfg(ngx)` 关闭，应用仍可构建，只是没有 VSR/NR 的 NGX 后端。
+
+### 3.3 NR 社区运行库
+
+- `captureplay_nvngx.dll` 是 `crates/nr-bridge` 编译出的转发宿主，GPL 代码，不含 NVIDIA 代码。
+- `nvngx_dlssnr.dll` 是社区修改、未签名的二进制，仓库不包含、不分发；用户自行放入 `runtime/nvidia-nr/`。
+- 社区 snippet 会校验调用方模块名，宿主仅用于满足该校验。这不是 NVIDIA 支持的使用方式，可能违反其许可条款；仅用于学习交流，不要作为稳定或商业特性依赖。
+
+### 3.4 runtime 目录
+
+`runtime/` 被 git 忽略（只保留 `runtime/README.md`）：
+
+| 路径 | 内容 | 环境变量 |
+|---|---|---|
+| `runtime/rtx-video-sdk/` | RTX Video SDK | 构建 `CAPTUREPLAY_RTX_VIDEO_SDK`；运行 `CAPTUREPLAY_RTX_VIDEO_RUNTIME` |
+| `runtime/nvidia-vfx/` | Video Effects 运行时 | `CAPTUREPLAY_VFX_RUNTIME` |
+| `runtime/nvidia-nr/` | 社区 `nvngx_dlssnr.dll` + `captureplay_nvngx.dll` | `CAPTUREPLAY_NR_RUNTIME`、`CAPTUREPLAY_NR_BRIDGE` |
+
+### 3.5 第三方归属
+
+- NR 的代理/残差颜色数学遵循 MIT 许可（原实现：video2dlssnr，© 2026 Daniil Sokolyuk），完整许可见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+- CUDA 的 FFI 声明依据 NVIDIA 公开的头文件与文档手写；仓库不包含任何 NVIDIA 头文件、库或运行时。

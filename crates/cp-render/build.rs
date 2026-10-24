@@ -100,6 +100,34 @@ const SHADERS: &[Shader] = &[
         out: "ngx_decode",
         defines: &["ENCODE=0", "TEXTURE_IO=1"],
     },
+    Shader {
+        file: "nr.hlsl",
+        entry: "main",
+        profile: "cs_6_0",
+        out: "nr_encode",
+        defines: &["ENCODE=1"],
+    },
+    Shader {
+        file: "nr.hlsl",
+        entry: "main",
+        profile: "cs_6_0",
+        out: "nr_composite",
+        defines: &[],
+    },
+    Shader {
+        file: "nr.hlsl",
+        entry: "main",
+        profile: "cs_6_0",
+        out: "nr_fill_depth",
+        defines: &["FILL_DEPTH=1"],
+    },
+    Shader {
+        file: "nr.hlsl",
+        entry: "main",
+        profile: "cs_6_0",
+        out: "nr_fill_motion",
+        defines: &["FILL_MOTION=1"],
+    },
 ];
 
 fn find_dxc() -> PathBuf {
