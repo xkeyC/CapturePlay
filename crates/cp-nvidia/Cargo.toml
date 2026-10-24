@@ -1,6 +1,6 @@
 [package]
 name = "cp-nvidia"
-description = "Bindings to NVIDIA runtimes: Optical Flow (NVOFA), NGX (DLSS NR), Video Effects SDK (VFG)."
+description = "Bindings to NVIDIA runtimes: CUDA interop, Video Effects SDK (VFG), RTX Video SDK (NGX VSR)."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

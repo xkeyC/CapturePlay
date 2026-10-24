@@ -23,6 +23,8 @@ pub const EGUI_VS: &[u8] = shader!("egui_vs");
 pub const EGUI_PS: &[u8] = shader!("egui_ps");
 pub const VFG_ENCODE: &[u8] = shader!("vfg_encode");
 pub const VFG_DECODE: &[u8] = shader!("vfg_decode");
+pub const NGX_ENCODE: &[u8] = shader!("ngx_encode");
+pub const NGX_DECODE: &[u8] = shader!("ngx_decode");
 
 /// A compute shader whose root signature is embedded in the bytecode.
 pub struct ComputePipeline {

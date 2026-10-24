@@ -4,7 +4,10 @@
 //! 1. converts every newly captured *unique* frame (duplicates from 30-in-60
 //!    cadences are released without touching the GPU),
 //! 2. asks the [`Pacer`] what is due,
-//! 3. builds that slot (real frame or interpolation),
+//! 3. builds that slot (real frame or interpolation) at the source
+//!    resolution, then upscales exactly that frame when an upscaler is active
+//!    (after interpolation: upscaling never sits on the ingest path, and
+//!    interpolation runs on the smaller frames),
 //! 4. waits on the swapchain's waitable object as late as possible, draws
 //!    output + UI and presents — on a variable-refresh display exactly at the
 //!    slot's target time, on a fixed-refresh one just before its vblank.
@@ -121,14 +124,13 @@ pub trait Enhancer {
 pub type Wake = Arc<dyn Fn() + Send + Sync>;
 
 /// Upscaling backend: source-resolution working frame → larger working
-/// frame, once per unique frame (before interpolation, which then runs at
-/// the upscaled size). When none is active, the output pass scales.
+/// frame, once per presented frame (after interpolation). When none is
+/// active, the output pass scales.
 pub trait Upscaler {
     fn name(&self) -> &'static str;
     /// Supported scale factors, ascending.
     fn factors(&self) -> &'static [f32];
-    /// Duration of the last upscale in ms.
-    fn last_ms(&self) -> f64;
+
     /// Readies the backend for `src → dst` without blocking (model loads
     /// happen in the background). Until it returns `true` the renderer keeps
     /// using output-pass scaling.
@@ -139,14 +141,9 @@ pub trait Upscaler {
         src: (u32, u32),
         dst: (u32, u32),
     ) -> bool;
-    /// Starts upscaling `src` (source size): records and submits what is
-    /// needed, continues in the background and calls `wake` when the result
-    /// can be collected. One frame is in flight at a time.
-    fn begin(&mut self, ctx: &mut RecordCtx<'_>, src: &Texture, wake: &Wake) -> Result<()>;
-    /// Records the transfer of the last result into `out` (target size)
-    /// and returns `true`; `false` while still running (only when
-    /// `!block`).
-    fn finish(&mut self, ctx: &mut RecordCtx<'_>, out: &Texture, block: bool) -> Result<bool>;
+    /// Records the upscale of `src` (source size) into `out` (target size)
+    /// on the frame's command list; GPU-ordered with the rest of the frame.
+    fn upscale(&mut self, ctx: &mut RecordCtx<'_>, src: &Texture, out: &Texture) -> Result<()>;
 }
 
 /// Display-driven target changes (window resize) apply after this long, so
@@ -270,13 +267,6 @@ struct NewFrame {
     arrival: HostTime,
 }
 
-/// A frame whose upscale is still running.
-struct PendingFrame {
-    pi: usize,
-    sizes: ((u32, u32), (u32, u32)),
-    frame: NewFrame,
-}
-
 struct PooledFrame {
     id: Option<u64>,
     tex: Texture,
@@ -314,6 +304,7 @@ pub struct Renderer {
     // Field order = drop order: GPU users first, the device last.
     frames: Vec<FrameCtx>,
     timer: crate::gpu_timer::GpuTimer,
+    upscale_timer: crate::gpu_timer::GpuTimer,
     frame_index: usize,
     list: ID3D12GraphicsCommandList,
     convert: ConvertPass,
@@ -325,14 +316,12 @@ pub struct Renderer {
     freeze: Freeze,
     enhancer: Option<Box<dyn Enhancer>>,
     upscaler: Option<Box<dyn Upscaler>>,
-    /// Source-resolution frame fed to the upscaler.
-    upscale_src: Option<Texture>,
+    /// Upscaled copy of the frame being presented, and which frame it is.
+    upscaled: Option<Texture>,
+    upscaled_for: Option<(Slot, (u32, u32))>,
     upscale_target: UpscaleTarget,
-    /// Working size actually used for the last frame.
-    upscale_effective: Option<(u32, u32)>,
-    /// Frame whose upscale is running on the backend's worker.
-    pending: Option<PendingFrame>,
-    wake: Wake,
+    /// Signaled with every wake: new captures or a finished upscale.
+    ingest_event: windows::Win32::Foundation::HANDLE,
     /// Next enhanced frame must reset temporal history.
     enhance_reset: bool,
     shown: Option<Slot>,
@@ -411,13 +400,29 @@ impl Renderer {
             l
         };
         let presenter = Presenter::new(&gpu, hwnd, size.0, size.1)?;
-        let wake: Wake = Arc::new(wake);
+        // SAFETY: anonymous auto-reset event, closed on drop.
+        let ingest_event =
+            unsafe { windows::Win32::System::Threading::CreateEventW(None, false, false, None)? };
+        let wake: Wake = {
+            let ev = ingest_event.0 as usize;
+            Arc::new(move || {
+                // SAFETY: the event outlives every wake source (the renderer
+                // joins workers and stops capture before dropping it).
+                unsafe {
+                    let _ = windows::Win32::System::Threading::SetEvent(
+                        windows::Win32::Foundation::HANDLE(ev as *mut _),
+                    );
+                }
+                wake();
+            })
+        };
         let upload = {
             let w = wake.clone();
             UploadRing::new(gpu.device.clone(), gpu.fence.clone(), move || w())
         };
         Ok(Self {
             timer: crate::gpu_timer::GpuTimer::new(&gpu, FRAMES_IN_FLIGHT)?,
+            upscale_timer: crate::gpu_timer::GpuTimer::new(&gpu, FRAMES_IN_FLIGHT)?,
             convert: ConvertPass::new(&gpu)?,
             output: OutputPass::new(&gpu)?,
             egui: EguiPass::new(&gpu)?,
@@ -430,11 +435,10 @@ impl Renderer {
             freeze: Freeze::Off,
             enhancer: None,
             upscaler: None,
-            upscale_src: None,
+            upscaled: None,
+            upscaled_for: None,
             upscale_target: UpscaleTarget::default(),
-            upscale_effective: None,
-            pending: None,
-            wake,
+            ingest_event,
             enhance_reset: true,
             shown: None,
             upload,
@@ -509,10 +513,8 @@ impl Renderer {
 
     pub fn set_upscaler(&mut self, upscaler: Option<Box<dyn Upscaler>>) {
         let _ = self.gpu.wait_idle();
-        if let Some(p) = self.pending.take() {
-            self.pool[p.pi].id = None;
-        }
         self.upscaler = upscaler;
+        self.upscaled_for = None;
         self.upscale_target = UpscaleTarget::default();
         self.stats.upscale = None;
     }
@@ -521,8 +523,10 @@ impl Renderer {
         self.upscaler.as_ref().map(|u| u.name())
     }
 
-    /// Working (possibly upscaled) size for a source frame.
-    fn working_size(&mut self, src: (u32, u32)) -> Option<(u32, u32)> {
+    /// Upscaled size for a presented frame of `src` size, once the backend
+    /// is ready for it (model loads happen in the background; until then the
+    /// output pass scales).
+    fn upscale_size(&mut self, src: (u32, u32)) -> Option<(u32, u32)> {
         let desired = self
             .upscaler
             .as_ref()
@@ -535,24 +539,58 @@ impl Renderer {
             (Some(dst), Some(up)) => up.prepare(&self.gpu, &self.heap, src, dst),
             _ => false,
         };
-        let effective = target.filter(|_| ready);
-        if effective != self.upscale_effective {
-            // Never interpolate between frames of different sizes.
-            self.pacer.reset();
-            self.upscale_effective = effective;
-        }
-        effective
+        target.filter(|_| ready)
     }
 
     pub fn enhancer_name(&self) -> Option<&'static str> {
         self.enhancer.as_ref().map(|e| e.name())
     }
 
-    /// Starts upscaling `upscale_src` for pool texture `pi`. On failure the
-    /// backend is dropped and `false` returned.
-    fn begin_upscale(&mut self) -> bool {
-        let (Some(mut up), Some(src)) = (self.upscaler.take(), self.upscale_src.as_ref()) else {
-            return false;
+    /// Upscales the frame about to be presented into `upscaled` (recorded on
+    /// the frame's list). Returns `false` (output-pass scaling) when no
+    /// upscale applies or it failed.
+    fn upscale_shown(&mut self, slot: Slot, src_is_interp: bool) -> Result<bool> {
+        let src_size = {
+            let src = if src_is_interp {
+                self.interp_out.as_ref()
+            } else {
+                self.slot_texture(slot)
+            };
+            match src {
+                Some(t) => (t.width, t.height),
+                None => return Ok(false),
+            }
+        };
+        let Some(dst) = self.upscale_size(src_size) else {
+            self.stats.upscale = None;
+            return Ok(false);
+        };
+        // Re-presenting the same frame (UI repaint, freeze): reuse.
+        if self.upscaled_for == Some((slot, dst)) {
+            return Ok(true);
+        }
+        if self
+            .upscaled
+            .as_ref()
+            .is_none_or(|t| (t.width, t.height) != dst)
+        {
+            self.upscaled = Some(Texture::new(
+                &self.gpu,
+                &self.heap,
+                TextureDesc::new(dst.0, dst.1, WORKING_FORMAT).uav(),
+            )?);
+        }
+        let Some(mut up) = self.upscaler.take() else {
+            return Ok(false);
+        };
+        let src = if src_is_interp {
+            self.interp_out.as_ref()
+        } else {
+            slot_texture(&self.pool, slot)
+        };
+        let (Some(src), Some(out)) = (src, self.upscaled.as_ref()) else {
+            self.upscaler = Some(up);
+            return Ok(false);
         };
         let f = &self.frames[self.frame_index];
         let mut ctx = RecordCtx {
@@ -562,59 +600,28 @@ impl Renderer {
             list: &self.list,
             allocator: &f.allocator,
         };
-        match up.begin(&mut ctx, src, &self.wake) {
+        self.upscale_timer.begin(ctx.list, self.frame_index);
+        let result = up.upscale(&mut ctx, src, out);
+        self.upscale_timer.end(ctx.list, self.frame_index);
+        match result {
             Ok(()) => {
+                self.stats.upscale = Some((src_size, dst));
+                self.upscaled_for = Some((slot, dst));
                 self.upscaler = Some(up);
-                true
+                Ok(true)
             }
             Err(e) => {
                 tracing::error!("upscaler {} failed, disabling it: {e}", up.name());
                 self.upscale_target = UpscaleTarget::default();
                 self.stats.upscale = None;
-                false
+                self.upscaled_for = None;
+                Ok(false)
             }
         }
     }
 
-    /// Collects the pending upscale (waiting for it when `block`) and
-    /// schedules its frame.
-    fn complete_upscale(&mut self, block: bool, refresh: Refresh) {
-        let Some(pi) = self.pending.as_ref().map(|p| p.pi) else {
-            return;
-        };
-        let Some(mut up) = self.upscaler.take() else {
-            self.pending = None;
-            self.pool[pi].id = None;
-            return;
-        };
-        let f = &self.frames[self.frame_index];
-        let mut ctx = RecordCtx {
-            gpu: &self.gpu,
-            heap: &self.heap,
-            ring: &mut self.ring,
-            list: &self.list,
-            allocator: &f.allocator,
-        };
-        match up.finish(&mut ctx, &self.pool[pi].tex, block) {
-            Ok(false) => self.upscaler = Some(up),
-            Ok(true) => {
-                let ms = up.last_ms();
-                let s = &mut self.stats.upscale_ms;
-                *s = if *s == 0.0 { ms } else { *s * 0.9 + ms * 0.1 };
-                self.upscaler = Some(up);
-                if let Some(p) = self.pending.take() {
-                    self.stats.upscale = Some(p.sizes);
-                    self.schedule_frame(&p.frame, refresh);
-                }
-            }
-            Err(e) => {
-                tracing::error!("upscaler {} failed, disabling it: {e}", up.name());
-                self.upscale_target = UpscaleTarget::default();
-                self.stats.upscale = None;
-                self.pending = None;
-                self.pool[pi].id = None;
-            }
-        }
+    fn slot_texture(&self, slot: Slot) -> Option<&Texture> {
+        slot_texture(&self.pool, slot)
     }
 
     /// Enhances a finished working frame and hands it to the pacer.
@@ -649,7 +656,8 @@ impl Renderer {
         } else {
             observed_ns
         };
-        let ready = HostTime::now().0;
+        let now = HostTime::now().0;
+        let ready = now;
         self.delay.push(ready - content_ns);
         let budget = self.delay.estimate().unwrap_or(ready - content_ns);
         // Content → display offset. Rises at once when frames need longer
@@ -661,7 +669,7 @@ impl Renderer {
             _ => needed,
         };
         self.offset_ns = Some(offset);
-        let base = (content_ns + offset).max(ready + self.lead_ns());
+        let base = (content_ns + offset).max(now + self.lead_ns());
         self.pacer.on_unique_frame(
             FrameRef {
                 id,
@@ -711,9 +719,6 @@ impl Renderer {
 
     /// Forget all frames (source changed).
     pub fn reset_source(&mut self) {
-        if let Some(p) = self.pending.take() {
-            self.pool[p.pi].id = None;
-        }
         self.cadence.reset();
         self.reset_timeline();
         self.shown = None;
@@ -761,16 +766,17 @@ impl Renderer {
         }
     }
 
-    /// Time ingesting one unique frame keeps the render thread busy
-    /// (conversion recording; upscaling runs on the backend's worker).
-    fn ingest_ns(&self) -> i64 {
-        1_500_000
-    }
-
     /// Time from starting to compose a slot until it is ready to present.
     fn lead_ns(&self) -> i64 {
         let gpu = (self.stats.interp_gpu_ms * 1e6) as i64;
-        (gpu + 1_500_000).clamp(2_000_000, 10_000_000)
+        // The upscale of the presented frame runs after interpolation, on
+        // the same queue.
+        let upscale = if self.stats.upscale.is_some() {
+            (self.stats.upscale_ms * 1e6) as i64
+        } else {
+            0
+        };
+        (gpu + upscale + 1_500_000).clamp(2_000_000, 14_000_000)
     }
 
     fn decode_params(&self) -> DecodeParams {
@@ -869,13 +875,11 @@ impl Renderer {
     }
 
     fn shown_ids(&self) -> Vec<u64> {
-        let mut ids = match self.shown {
+        match self.shown {
             Some(Slot::Real { id }) => vec![id],
             Some(Slot::Interp { prev, next, .. }) => vec![prev, next],
             None => vec![],
-        };
-        ids.extend(self.pending.as_ref().map(|p| p.frame.id));
-        ids
+        }
     }
 
     fn begin_frame(&mut self) -> Result<()> {
@@ -884,6 +888,10 @@ impl Renderer {
         self.gpu.wait(f.fence)?;
         self.egui
             .free_textures(&std::mem::take(&mut f.pending_free));
+        if let Some(ms) = self.upscale_timer.read(self.frame_index) {
+            let s = &mut self.stats.upscale_ms;
+            *s = if *s == 0.0 { ms } else { *s * 0.9 + ms * 0.1 };
+        }
         if let Some(ms) = self.timer.read(self.frame_index) {
             let s = &mut self.stats.interp_gpu_ms;
             *s = if *s == 0.0 { ms } else { *s * 0.9 + ms * 0.1 };
@@ -934,33 +942,36 @@ impl Renderer {
             return self.compose_and_present(self.shown, ui, None);
         }
 
-        // 0. A slot that falls due before ingest could finish is presented
-        // first.
-        let ready_frames = self.upload.take_ready();
-        let mut ui = ui;
-        let no_texture_updates = egui::TexturesDelta::default();
-        if !ready_frames.is_empty() {
-            let horizon = HostTime::now().0 + self.lead_ns() + slack_ns(refresh) + self.ingest_ns();
-            if let Some(p) = self.pacer.take_due(horizon) {
-                self.begin_frame()?;
-                let r = self.compose_and_present(Some(p.slot), ui, Some(p.target_ns))?;
-                if r == PresentResult::DeviceLost {
-                    for f in ready_frames {
-                        self.upload.release(f.slot, 0);
-                    }
-                    return Ok(r);
-                }
-                // Textures were uploaded with that frame.
-                ui = ui.map(|u| EguiFrame {
-                    textures_delta: &no_texture_updates,
-                    ..u
-                });
-            }
-        }
-
-        // 1. Ingest: collect a finished upscale, then convert new frames.
+        // 1. Ingest new frames / a finished upscale.
+        self.ingest(refresh)?;
         self.begin_frame()?;
-        self.complete_upscale(false, refresh);
+
+        // 2. What is due? Anything whose present time falls within the
+        // compose lead (plus a little wake-up tolerance).
+        let horizon = HostTime::now().0 + self.lead_ns() + slack_ns(refresh) + 500_000;
+        let due: Option<Planned> = self.pacer.take_due(horizon);
+        let slot = due
+            .map(|p| p.slot)
+            .or(if force { self.shown } else { None });
+
+        if slot.is_some() || force {
+            self.compose_and_present(slot, ui, due.map(|p| p.target_ns))
+        } else {
+            self.finish()?;
+            Ok(PresentResult::Ok)
+        }
+    }
+
+    /// Converts newly captured frames and collects a finished upscale in a
+    /// submission of its own. Cheap (upscaling runs on the backend's
+    /// worker), so it also runs while waiting to present a composed slot:
+    /// a frame arriving then must not wait for that present.
+    fn ingest(&mut self, refresh: Refresh) -> Result<()> {
+        let ready_frames = self.upload.take_ready();
+        if ready_frames.is_empty() {
+            return Ok(());
+        }
+        self.begin_frame()?;
         let mut converted_slots = Vec::new();
         for f in ready_frames {
             self.stats.captured += 1;
@@ -978,32 +989,12 @@ impl Renderer {
                 self.upload.release(f.slot, 0);
                 continue;
             };
-            // One upscale in flight: the previous one owns the backend's
-            // buffers and its pool texture.
-            self.complete_upscale(true, refresh);
             let src = (f.meta.mode.width, f.meta.mode.height);
-            let target = self.working_size(src);
-            let pi = self.pool_texture(target.unwrap_or(src))?;
+            let pi = self.pool_texture(src)?;
             let id = self.next_id;
             self.next_id += 1;
             self.pool[pi].id = Some(id);
             let params = self.decode_params();
-            if target.is_some()
-                && self
-                    .upscale_src
-                    .as_ref()
-                    .is_none_or(|t| (t.width, t.height) != src)
-            {
-                self.upscale_src = Some(Texture::new(
-                    &self.gpu,
-                    &self.heap,
-                    TextureDesc::new(src.0, src.1, WORKING_FORMAT).uav(),
-                )?);
-            }
-            let convert_dst = match (target, self.upscale_src.as_ref()) {
-                (Some(_), Some(t)) => t,
-                _ => &self.pool[pi].tex,
-            };
             self.convert.record(
                 &self.gpu,
                 &self.heap,
@@ -1014,7 +1005,7 @@ impl Renderer {
                 &f.meta.mode,
                 &f.meta.color,
                 params,
-                convert_dst,
+                &self.pool[pi].tex,
             )?;
             converted_slots.push(f.slot);
             let frame = NewFrame {
@@ -1025,46 +1016,14 @@ impl Renderer {
                 signal_ns,
                 arrival: f.meta.arrival,
             };
-            match target {
-                Some(dst) => {
-                    if self.begin_upscale() {
-                        self.pending = Some(PendingFrame {
-                            pi,
-                            sizes: (src, dst),
-                            frame,
-                        });
-                    } else {
-                        // Frame is lost; later frames take the output-pass path.
-                        self.pool[pi].id = None;
-                    }
-                }
-                None => {
-                    self.stats.upscale = None;
-                    self.schedule_frame(&frame, refresh);
-                }
-            }
+            self.schedule_frame(&frame, refresh);
         }
-
-        // 2. What is due? Anything whose present time falls within the
-        // compose lead (plus a little wake-up tolerance).
-        let horizon = HostTime::now().0 + self.lead_ns() + slack_ns(refresh) + 500_000;
-        let due: Option<Planned> = self.pacer.take_due(horizon);
-        let slot = due
-            .map(|p| p.slot)
-            .or(if force { self.shown } else { None });
-
-        let result = if slot.is_some() || force {
-            self.compose_and_present(slot, ui, due.map(|p| p.target_ns))?
-        } else {
-            // Nothing to show: still submit conversions.
-            self.finish()?;
-            PresentResult::Ok
-        };
+        self.finish()?;
         let fence = self.frames[self.frame_index].fence;
         for s in converted_slots {
             self.upload.release(s, fence);
         }
-        Ok(result)
+        Ok(())
     }
 
     /// Builds `slot` (or black when `None`), draws the UI and presents — at
@@ -1103,6 +1062,10 @@ impl Renderer {
         if src_is_interp && self.freeze == Freeze::Pending {
             self.freeze = Freeze::Frozen;
         }
+        let upscaled = match slot {
+            Some(s) => self.upscale_shown(s, src_is_interp)?,
+            None => false,
+        };
 
         // Wait for the swapchain as late as possible (lowest latency).
         self.presenter.wait_for_frame(100);
@@ -1121,15 +1084,12 @@ impl Renderer {
         };
 
         let params = self.output_params();
-        let src = if src_is_interp {
+        let src = if upscaled {
+            self.upscaled.as_ref()
+        } else if src_is_interp {
             self.interp_out.as_ref()
         } else {
-            match slot {
-                Some(Slot::Real { id }) => {
-                    self.pool.iter().find(|p| p.id == Some(id)).map(|p| &p.tex)
-                }
-                _ => None,
-            }
+            slot.and_then(|s| slot_texture(&self.pool, s))
         };
         self.output.record(
             &self.gpu,
@@ -1165,7 +1125,11 @@ impl Renderer {
         };
         self.finish()?;
         if let Some(t) = target_ns {
-            self.sleep.until(t - slack_ns(self.refresh()));
+            let deadline = t - slack_ns(self.refresh());
+            while self.sleep.until_or(deadline, Some(self.ingest_event)) {
+                let refresh = self.refresh();
+                self.ingest(refresh)?;
+            }
         }
         let r = self.presenter.present(self.config.vsync);
         if let Some(t) = target_ns {
@@ -1276,6 +1240,12 @@ impl Renderer {
 impl Drop for Renderer {
     fn drop(&mut self) {
         let _ = self.gpu.wait_idle();
+        // Stop upscale workers before the event they signal goes away.
+        self.upscaler = None;
+        // SAFETY: event owned by the renderer.
+        unsafe {
+            let _ = windows::Win32::Foundation::CloseHandle(self.ingest_event);
+        }
     }
 }
 
@@ -1285,5 +1255,13 @@ fn slack_ns(refresh: Refresh) -> i64 {
     match refresh {
         Refresh::Variable { .. } => 0,
         Refresh::Fixed { period_ns, .. } => (period_ns / 4).min(1_000_000),
+    }
+}
+
+/// Pool texture holding a real slot's frame.
+fn slot_texture(pool: &[PooledFrame], slot: Slot) -> Option<&Texture> {
+    match slot {
+        Slot::Real { id } => pool.iter().find(|p| p.id == Some(id)).map(|p| &p.tex),
+        Slot::Interp { .. } => None,
     }
 }

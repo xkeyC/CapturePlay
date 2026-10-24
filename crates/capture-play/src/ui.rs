@@ -434,6 +434,8 @@ pub fn draw(ctx: &egui::Context, s: &mut Settings, v: &UiView<'_>) -> Vec<Action
                 st.present_jitter_ms.map_or_else(|| "—".to_string(), |j| format!("{j:.2} ms")),
                 v.adapter
             ));
+            // Attribution required by the NVIDIA SDK licenses.
+            ui.small(t.credits);
         });
 
     if changed {

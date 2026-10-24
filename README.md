@@ -79,9 +79,10 @@ FLIP_DISCARD、3 缓冲、`SetMaximumFrameLatency(1)`、可等待对象在录制
 - **可变刷新（G-SYNC/FreeSync/HDMI VRR）**：帧在 Present 时即显示，因此渲染线程提前一个合成量唤醒、录制提交，再用高精度定时器 + 短自旋**精确在目标时刻 Present**（以前会提前最多半个刷新周期，在 VRR 上直接变成 2 ms 抖动）。任何倍数都可用（240 Hz 上 42 fps × 3 ≈ 126 fps）。
 - **固定刷新**：目标对齐 vblank 网格，并只用步长为整数个刷新周期的倍数（240 Hz 上 30 fps 用 2×/4×，3× 会 8.3/12.5 ms 交替）。
 - **自动检测**：用 `GetFrameStatistics`（`PresentRefreshCount` 换算到该帧实际上屏的 vblank）比对目标与实际：不在网格上的目标若仍被吸附到网格 → 固定刷新，否则 → VRR。实测 RTX 4090 + 240 Hz 显示器无边框全屏为 VRR。UI 可强制模式，并显示呈现抖动（实际−目标偏差的 p95）。
-- VSR 在工作线程上 CPU 同步（见 6.3），渲染线程不被阻塞；有新帧待摄入且槽位将到期时先呈现再摄入。
+- 等待 Present 时刻期间可被新采集帧唤醒：摄入（转换录制与提交，< 1 ms）立即进行，新帧不必等这次 Present。
+- 超分在插帧之后、对每个要呈现的帧进行（见 6.3），在 GPU 队列上按序执行，不在摄入链路上；合成提前量相应包含 VSR 的 GPU 时间。
 
-实测（PS5 ~42 fps，1440p60 P010 → VSR 4K → VFG 3×，240 Hz VRR）：输出约 126 fps，大多数帧实际上屏间隔与目标相差 < 0.5 ms，p95 抖动约 2–3 ms；VSR 在渲染线程同步时为 3–4 ms 且交界处频繁晚到。到达→呈现延迟约 25–37 ms（含 3× 的 2/3 源帧间隔 ≈ 16 ms 与重建等待）。
+实测（PS5 ~42 fps，1440p60 P010，240 Hz VRR）：VFG 3× 输出约 126 fps，大多数帧实际上屏间隔与目标相差 < 0.5 ms；到达→呈现延迟约 25–37 ms（含 3× 的 2/3 源帧间隔 ≈ 16 ms 与重建等待）。3× + 后置 RTX VSR（NGX）：约 130 fps，延迟 21–32 ms。
 
 ## 4. HDR 方案
 
@@ -150,40 +151,43 @@ GPU 时间用时间戳查询测量，包含 CUDA 跨引擎部分。UI 提供 **�
 
 | 方案 | 类型 | 是否适合采集画面 | 集成/许可 |
 |---|---|---|---|
-| **NVIDIA VSR**（VFX SDK `VideoSuperRes`，即 RTX Video Super Resolution 模型 `nvngx_vsr.dll`） | AI 空间超分 + 压缩伪影修复 | ✅ 为视频设计，逐帧、无需运动向量 | 官方 VFX SDK 运行时，动态加载，与 VFG 共用 D3D12↔CUDA 桥 |
-| DLSS SR（Transformer） | 游戏时序超分 | ❌ 依赖引擎运动向量/深度/抖动；采集画面只能喂零或光流（光流在边界不可靠，见 5.2） | 需 NGX core 静态库或 Streamline，且不面向视频 |
+| **NVIDIA RTX Video Super Resolution**（模型 `nvngx_vsr.dll`） | AI 空间超分 + 压缩伪影修复 | ✅ 为视频设计，逐帧、无需运动向量 | **采用**：RTX Video SDK（NGX）在 D3D12 上调用，见 6.3。早期经 Video Effects SDK `VideoSuperRes` 接入，有一帧滞后，已弃用（6.2 第 4 点） |
+| DLSS SR（Transformer） | 游戏时序超分 | ❌ 依赖引擎运动向量/深度/抖动；采集画面只能喂零或光流（光流在边界不可靠，见 5.2） | 不面向视频 |
 | FSR 1 / NIS | 传统空间超分 + 锐化 | ✅ | MIT 着色器，可作非 NVIDIA 备选 |
-| Catmull-Rom | 插值缩放 | ✅ | 已实现（改为 PQ 感知域，作为 VSR 备选） |
+| Catmull-Rom | 插值缩放 | ✅ | 已实现（PQ 感知域，作为 VSR 备选） |
 
 ### 6.2 真值测试（真实游戏画面）
 
-方法（`crates/cp-render/src/upscale_bench.rs`）：用采集卡抓取 PS5《战神：诸神黄昏》**原生 4K HDR** 帧（4K30 P010），在线性光下面积平均缩到 1440p，再由各方案放大回 4K，与原图在 **PQ 感知域**比较 PSNR；3 帧结果一致，下表为 frame_0。耗时为 RTX 4090 上 1440p→4K 单帧，`cuCtxSynchronize` 计时。
+方法（`crates/cp-render/src/upscale_bench.rs`）：用采集卡抓取 PS5《战神：诸神黄昏》**原生 4K HDR** 帧（4K30 P010），在线性光下面积平均缩到 1440p，再由各方案放大回 4K，与原图在 **PQ 感知域**比较 PSNR。VSR 走与应用相同的完整路径（编码 → NGX → 解码）；耗时为 RTX 4090 上 1440p→4K 单帧 GPU 时间，含编解码。
 
 | 方案 | PSNR | 耗时 |
 |---|---|---|
 | 双线性（线性光） | 30.77 dB | — |
-| Catmull-Rom（当前，线性光） | 31.49 dB | ~0.1 ms |
+| Catmull-Rom（线性光） | 31.49 dB | ~0.1 ms |
 | Lanczos3（线性光） | 31.27 dB | — |
-| VSR Bicubic（非 AI，PQ 域） | 32.69 dB | 0.43 ms |
-| VSR Low / Medium | 32.64 / 32.53 dB | 1.47 / 1.72 ms |
-| **VSR High** | **32.88 dB** | 4.42 ms |
-| VSR Ultra | 32.59 dB | 4.88 ms |
-| VSR HighBitrate High / Ultra | 32.11 / 32.19 dB | 4.78 / 6.75 ms |
-| VSR Streaming Medium / Ultra | 31.22 / 30.30 dB | 2.46 / 8.39 ms |
+| Catmull-Rom（PQ 域，备选路径） | 32.68 dB | ~0.1 ms |
+| RTX VSR Bicubic（非 AI） | 32.69 dB | 0.30 ms |
+| RTX VSR Low / Medium | 32.65 / 32.53 dB | 1.18 / 1.53 ms |
+| **RTX VSR High** | **32.88 dB** | 3.61 ms |
+| RTX VSR Ultra | 32.60 dB | 4.94 ms |
 
 结论：
-1. **10-bit 输入应使用 PQ 编码**：同样的模型喂“0–1000 nit 的 sRGB 曲线”编码，各档低 1–3 dB。
-2. VSR High 比当前 Catmull-Rom 高约 1.4 dB，视觉上叶脉、苔藓等高频细节明显更清晰；Ultra / HighBitrate / Streaming 档在这类干净的游戏画面上没有收益。
-3. PSNR 增益的相当一部分来自“在感知域（PQ）而非线性光中插值”（VSR Bicubic 已 +1.2 dB）。这对现有 Catmull-Rom 也是一个零成本的改进方向。
-4. **同步陷阱**：VSR 在 SDK 内部的 CUDA 流上执行，挂在我们流上的完成 fence 在 0.70 ms 就触发，实际计算到 3.90 ms 才结束（测试 `vsr_completion_fence_is_not_stream_ordered`）。集成时不能依赖流顺序，需在工作线程上等待计算完成后再从 CPU 端 signal D3D12 fence。VFG 没有这个问题（fence 与实际完成同为 1.42 ms）。
+1. **10-bit 输入应使用 PQ 编码**：同样的模型喂“0–1000 nit 的 sRGB 曲线”编码，各档低 1–3 dB。SDK 文档称 VSR 面向 SDR，但 PQ 编码的 HDR10 作为 10-bit 信号送入效果最好。
+2. VSR High 比 Catmull-Rom 高约 1.4 dB，视觉上叶脉、苔藓等高频细节明显更清晰；Ultra 档在这类干净的游戏画面上没有收益。
+3. PSNR 增益的相当一部分来自“在感知域（PQ）而非线性光中插值”，Catmull-Rom 已据此改为 PQ 域。
+4. **Video Effects SDK 路径的一帧滞后**（已弃用）：`NvVFX_Run` 写出的是*最近一次完成*的结果并把新输入排队，单次调用得到的是上一帧（与档位、CUDA 流、async 标志无关，首次调用输出为空）；其计算在 SDK 内部流上，完成 fence 也不按流排序（0.70 ms 触发、3.90 ms 才算完）。要拿到本帧只能“运行 → `cuCtxSynchronize` → 再运行”，GPU 时间翻倍，且需 CPU 同步。慢速平移测试 `slow_pan_temporal_stability`（每帧平移 0.6 个 4K 像素）量化了它：单次运行时输出与*上一帧*真值吻合（32.5–33 dB）、与本帧只有 30.9 dB——表现为开超分后慢速转视角抖动。NGX D3D12 路径单次调用即与本帧对齐，该测试作为回归保护（所有档位须与本帧对齐）。对齐后 VSR 的时间稳定性与 Catmull-Rom 相当（36.1–36.4 vs 36.0 dB），模型本身不闪烁。
 
-### 6.3 实现
-- 管线：采集 1440p → 转换 → **VSR（PQ 编码，默认 Medium）→ 4K** → VFG（4K，约 2.1 ms）→ 输出。每个唯一帧只做一次超分（30/s），补帧在 4K 上进行。
+### 6.3 实现（RTX Video SDK，NGX D3D12）
+- `cp_nvidia::ngx`：依据公开头文件手写的 FFI（`NVSDK_NGX_D3D12_Init/CreateFeature/EvaluateFeature_C`、参数 setter），进程内初始化一次，所有调用串行化（NGX 非线程安全）。SDK 静态库 `nvsdk_ngx_d.lib` 构建时存在才链接（`cfg(ngx)`），否则该后端不编译。
+- `cp_render::NgxVsrUpscaler`：编码（FP16 线性 scRGB → PQ BT.2020 `R10G10B10A2_UNORM` 纹理）→ VSR → 解码，**全部录在帧自己的命令列表里**，与插帧、输出在同一队列上按序执行；无 CUDA 互操作、无 CPU 等待。VSR 特性（模型）在后台线程创建一次（约 2.6 s），尺寸与档位是每次调用的参数，窗口改尺寸不重建。
+- 管线：采集 1440p → 转换 → VFG（1440p）→ **VSR → 4K** → 输出。超分**后置**：对每个呈现的帧各做一次，同一帧重复呈现（UI 刷新、定格）复用结果；摄入链路上只有转换。VSR 的 GPU 时间单独计时并计入合成提前量。
 - 目标尺寸：按显示区域选 VSR 支持的最小覆盖倍数（4/3、1.5、2、3、4×，`cp_core::scale`）；窗口尺寸变化 300 ms 去抖，画面不大于窗口时不超分。
-- 同步：渲染线程录制编码并提交 → **VSR 工作线程**等待编码 fence → CPU signal 生产者 fence → VSR → `cuCtxSynchronize` → 唤醒渲染线程 → 录制解码，此后该帧才进入排程（见 6.2 第 4 点）。渲染线程从不等待 VSR，否则每个新帧会阻塞约 3 ms、拖晚到期的插值帧（实测抖动明显变差）。
-- 会话（模型）加载约 2 s，在后台线程进行；加载完成前由输出阶段缩放，不阻塞渲染。实测 1440p60 HDR → 4K 全屏：稳态 VSR **1.62 ms/帧**，启用瞬间有约 1 s 的轻微掉帧（首次运行初始化），可接受。
-- 备选：VSR 关闭或不可用时，输出阶段用 **PQ 感知域 Catmull-Rom**（+1.2 dB，对比线性光）。
-- DLSS SR 不采用；非 NVIDIA 显卡可加 FSR 1 作为备选。
+- **“Artifact Reduction”不是独立功能**：SDK 中它是 VSR 的组成部分（“Upscale SDR Surface with Artifact Reduction”），无单独参数，针对视频压缩伪影；后置超分时已作用于每个呈现帧。NGX 也接受 1:1（不放大）调用，但真值测试 `vsr_on_interpolated_frame` 表明它**不能修复插帧伪影**：VFG 中间帧与真实帧的差距经 1:1 VSR（两者都处理）后从 47.05 dB 变为 44.9 dB（均衡档），即增强把插值误差一并放大。因此不为插帧额外启用。插帧伪影的有效手段是 VFG 档位（边缘 PSNR 低/中/高 26.1 / 27.8 / 32.6 dB，见 5.2），受单帧预算约束。
+- 同一时刻只建一个 VSR 特性实例：测试中同时创建 5 个时后续实例未能就绪；应用切换档位时先释放旧实例再加载新实例。
+- 实测（PS5 ~42 fps，1440p60 P010 → 4K，VFG 3×，240 Hz VRR）：VSR Medium 约 1.35 ms/帧，输出约 130 fps，延迟 21–32 ms，呈现抖动 p95 1.3–2.6 ms。
+- **单帧预算**：每个输出帧的 GPU 工作（插帧 + 超分 + 输出）须小于输出帧间隔（42 fps 内容：2× 11.9 ms、3× 7.9 ms）。高档位明显更贵：VFG（1440p）低/中/高 0.52 / 1.67 / **7.44 ms**，VSR 低/中/高/极致 1.16 / 1.48 / 3.67 / 5.26 ms。VFG 高 + 3× 已超出预算，会晚帧抖动。
+- 备选：VSR 关闭或不可用时，输出阶段用 **PQ 感知域 Catmull-Rom**。
+- 许可：RTX Video SDK 受 NVIDIA RTX SDKs License 约束（不进仓库、随应用以目标代码分发、应用内署名、商业发布前通知 NVIDIA），见 `runtime/README.md` 与第 12 节。
 
 ## 7. 音频
 
@@ -201,14 +205,14 @@ GPU 时间用时间戳查询测量，包含 CUDA 跨引擎部分。UI 提供 **�
 
 ## 9. 构建与运行
 
-需求：Windows 10/11 x64，Rust 1.95+（MSVC 工具链），Windows SDK（`dxc.exe`，构建时编译 HLSL 为签名 DXIL；可用 `DXC_PATH` 指定），D3D12 显卡；补帧需要 NVIDIA RTX 40/50 显卡与 VFG 运行时。
+需求：Windows 10/11 x64，Rust 1.95+（MSVC 工具链），Windows SDK（`dxc.exe`，构建时编译 HLSL 为签名 DXIL；可用 `DXC_PATH` 指定），D3D12 显卡；补帧需要 NVIDIA RTX 40/50 显卡与 VFG 运行时；超分需要 NVIDIA RTX 显卡，并在**构建前**把 RTX Video SDK 解压到 `runtime/rtx-video-sdk/`（未找到时照常构建，只是没有 AI 超分）。
 
 ```powershell
 cargo build --release
 .\target\release\capture-play.exe
 ```
 
-可选 NVIDIA Video Effects 运行时（VFG、VSR）放到 `runtime/nvidia-vfx/`（见 `runtime/README.md`）。
+可选的 NVIDIA 组件放到 `runtime/`（git 忽略）：Video Effects 运行时（VFG）放 `runtime/nvidia-vfx/`，RTX Video SDK（VSR）放 `runtime/rtx-video-sdk/`，详见 `runtime/README.md`。
 
 | 操作 | 快捷键 |
 |---|---|
@@ -242,10 +246,10 @@ cargo build --release
 
 ## 12. 许可证
 
-本项目以 **GPL-3.0-or-later** 发布，见 [LICENSE](LICENSE)。
+本项目以 **GPL-3.0-or-later** 发布，见 [LICENSE](LICENSE)，并附带 GPLv3 第 7 条的**附加许可**，见 [LICENSE-EXCEPTION.md](LICENSE-EXCEPTION.md)：允许与 NVIDIA 专有组件（RTX Video SDK / NGX 库与运行时、Video Effects SDK 运行时、CUDA）链接或组合后分发。**这些专有 SDK 不属于本项目、不受 GPL 约束**，仍按 NVIDIA 各自的许可条款使用，需由使用者自行接受与遵守。
 
-仓库**不包含**任何专有 SDK、头文件或运行时。运行时按需动态加载：
+仓库**不包含**任何专有 SDK、头文件、库或运行时：
 - 随 NVIDIA 显卡驱动提供：`nvcuda.dll`（CUDA driver）。
-- 用户自行安装：NVIDIA Video Effects SDK 运行时（VFG、VSR），见 `runtime/README.md`，受 NVIDIA 许可约束。
+- 用户自行获取并放入 git 忽略的 `runtime/`：NVIDIA Video Effects SDK 运行时（VFG）、RTX Video SDK（VSR），见 `runtime/README.md`。
 
-CUDA 的 FFI 声明依据 NVIDIA 公开的头文件与文档手写。分发捆绑专有运行时的二进制包前，请自行评估 GPL 兼容性（例如为这些运行时添加 GPLv3 第 7 节的附加许可）。
+CUDA 的 FFI 声明依据 NVIDIA 公开的头文件与文档手写。

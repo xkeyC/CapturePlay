@@ -84,6 +84,7 @@ pub struct Strings {
     pub stats_output: &'static str,
     pub stats_interp: &'static str,
     pub stats_latency: &'static str,
+    pub credits: &'static str,
     pub stats_interp_gpu: &'static str,
 }
 
@@ -165,6 +166,7 @@ pub static ZH: Strings = Strings {
     stats_output: "输出",
     stats_interp: "补帧",
     stats_latency: "延迟(到达→呈现)",
+    credits: "使用 NVIDIA RTX Video SDK（超分）与 NVIDIA Video Effects SDK（补帧）",
     stats_interp_gpu: "补帧 GPU 耗时/帧",
 };
 
@@ -246,6 +248,7 @@ pub static EN: Strings = Strings {
     stats_output: "Output",
     stats_interp: "Interp",
     stats_latency: "Latency (arrival→present)",
+    credits: "Uses the NVIDIA RTX Video SDK (super resolution) and the NVIDIA Video Effects SDK (frame generation)",
     stats_interp_gpu: "Interp GPU time/frame",
 };
 

@@ -138,7 +138,30 @@ pub fn spawn(
     })
 }
 
-/// Where the NVIDIA Video Effects runtime DLLs (VFG, VSR) are looked up.
+/// Folders searched for the RTX Video SDK feature DLL (`nvngx_vsr.dll`), in
+/// order: `$CAPTUREPLAY_RTX_VIDEO_RUNTIME`, the executable's folder, then
+/// `runtime/rtx-video-sdk/bin/Windows/x64/rel` next to the executable or in
+/// any parent (finds the repository's `runtime/` from `target/release`).
+fn rtx_video_dirs() -> Vec<std::path::PathBuf> {
+    let exe = std::env::current_exe().unwrap_or_default();
+    let mut dirs: Vec<std::path::PathBuf> = std::env::var_os("CAPTUREPLAY_RTX_VIDEO_RUNTIME")
+        .map(Into::into)
+        .into_iter()
+        .collect();
+    dirs.extend(exe.parent().map(std::path::Path::to_path_buf));
+    dirs.extend(exe.ancestors().skip(1).map(|d| {
+        d.join("runtime")
+            .join("rtx-video-sdk")
+            .join("bin")
+            .join("Windows")
+            .join("x64")
+            .join("rel")
+    }));
+    dirs.retain(|d| cp_nvidia::ngx::runtime_present(d));
+    dirs
+}
+
+/// Where the NVIDIA Video Effects runtime DLLs (VFG) are looked up.
 fn vfx_runtime_dir(s: &Settings) -> std::path::PathBuf {
     if let Some(d) = &s.interpolation.vfx_runtime_dir {
         return d.into();
@@ -361,7 +384,7 @@ impl State {
     /// (Re)creates the upscaler when its settings changed.
     fn apply_upscaler(&mut self) {
         use cp_core::settings::{UpscaleBackend, VsrQualitySetting};
-        use cp_nvidia::vsr::VsrQuality;
+        use cp_nvidia::ngx::VsrQuality;
         let want = self.settings.upscale;
         if self.upscale_backend == Some(want) {
             return;
@@ -376,9 +399,10 @@ impl State {
                     VsrQualitySetting::High => VsrQuality::High,
                     VsrQualitySetting::Ultra => VsrQuality::Ultra,
                 };
-                match cp_render::VsrUpscaler::new(
+                match cp_render::NgxVsrUpscaler::new(
                     self.renderer.gpu(),
-                    vfx_runtime_dir(&self.settings),
+                    rtx_video_dirs(),
+                    config::data_dir().join("ngx"),
                     quality,
                 ) {
                     Ok(u) => Some(Box::new(u)),

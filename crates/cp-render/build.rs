@@ -86,6 +86,20 @@ const SHADERS: &[Shader] = &[
         out: "vfg_decode",
         defines: &["ENCODE=0"],
     },
+    Shader {
+        file: "vfg.hlsl",
+        entry: "main",
+        profile: "cs_6_0",
+        out: "ngx_encode",
+        defines: &["ENCODE=1", "TEXTURE_IO=1"],
+    },
+    Shader {
+        file: "vfg.hlsl",
+        entry: "main",
+        profile: "cs_6_0",
+        out: "ngx_decode",
+        defines: &["ENCODE=0", "TEXTURE_IO=1"],
+    },
 ];
 
 fn find_dxc() -> PathBuf {

@@ -22,7 +22,7 @@ pub mod renderer;
 pub mod shaders;
 pub mod texture;
 pub mod upload;
-pub mod upscale_vsr;
+pub mod upscale_ngx;
 
 #[cfg(test)]
 mod testutil;
@@ -38,4 +38,4 @@ pub use renderer::{
     Enhancer, FrameInput, Interpolator, RecordCtx, RenderConfig, RenderStats, Renderer, Upscaler,
 };
 pub use texture::Texture;
-pub use upscale_vsr::VsrUpscaler;
+pub use upscale_ngx::NgxVsrUpscaler;

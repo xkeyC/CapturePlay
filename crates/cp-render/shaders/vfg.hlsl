@@ -1,4 +1,6 @@
-// Working frame <-> NVIDIA VFG packed RGB10A2 buffers (shared with CUDA).
+// Working frame <-> RGB10A2 encodings for NVIDIA effects: packed buffers
+// shared with CUDA (VFG), or R10G10B10A2_UNORM textures (TEXTURE_IO=1, NGX
+// RTX Video Super Resolution on D3D12).
 //
 // HDR content is encoded as PQ / BT.2020 (perceptually uniform, keeps wide
 // gamut); SDR content as sRGB relative to SDR white, which is what the model
@@ -43,7 +45,31 @@ float3 decode(float3 e)
     return srgb_to_linear(e) * sdr_white;
 }
 
-#if ENCODE
+#if TEXTURE_IO && ENCODE
+Texture2D<float4> Source : register(t0);
+RWTexture2D<float4> Encoded : register(u0);
+
+[RootSignature(RS)]
+[numthreads(8, 8, 1)]
+void main(uint2 id : SV_DispatchThreadID)
+{
+    if (id.x >= width || id.y >= height)
+        return;
+    Encoded[id] = float4(saturate(encode(Source.Load(int3(id, 0)).rgb)), 1.0);
+}
+#elif TEXTURE_IO
+Texture2D<float4> Encoded : register(t0);
+RWTexture2D<float4> Output : register(u0);
+
+[RootSignature(RS)]
+[numthreads(8, 8, 1)]
+void main(uint2 id : SV_DispatchThreadID)
+{
+    if (id.x >= width || id.y >= height)
+        return;
+    Output[id] = float4(decode(Encoded.Load(int3(id, 0)).rgb), 1.0);
+}
+#elif ENCODE
 Texture2D<float4> Source : register(t0);
 RWByteAddressBuffer Packed : register(u0);
 
