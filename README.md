@@ -3,6 +3,8 @@
 低延迟采集卡播放器：**PS5 / 游戏机 → HDMI 采集卡 → PC → 实时补帧 → 原生 HDR 输出**。
 Rust + Direct3D 12，单进程、单交换链，Windows 10/11。
 
+**简体中文** | [English](README.en.md)
+
 > 技术预览（0.1.0）。
 
 ---
