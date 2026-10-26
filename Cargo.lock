@@ -544,6 +544,7 @@ dependencies = [
 name = "cp-nvidia"
 version = "0.1.0"
 dependencies = [
+ "ash",
  "thiserror 2.0.21",
  "tracing",
  "windows",

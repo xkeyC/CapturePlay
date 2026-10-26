@@ -30,6 +30,8 @@ pub const OUTPUT_VS: &[u8] = shader!("output_vs");
 pub const OUTPUT_PS: &[u8] = shader!("output_ps");
 pub const EGUI_VS: &[u8] = shader!("egui_vs");
 pub const EGUI_PS: &[u8] = shader!("egui_ps");
+pub const NGX_ENCODE: &[u8] = shader!("ngx_encode");
+pub const NGX_DECODE: &[u8] = shader!("ngx_decode");
 
 pub const BINDING_SRV: u32 = 0;
 pub const BINDING_UAV: u32 = 8;

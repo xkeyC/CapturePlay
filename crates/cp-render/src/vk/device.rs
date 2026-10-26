@@ -25,6 +25,8 @@ pub struct Features {
     pub present_timing: bool,
     /// The `presentAtAbsoluteTime` feature is enabled.
     pub present_at_absolute_time: bool,
+    /// Every extension NGX asked for is enabled (VSR on Vulkan).
+    pub ngx: bool,
 }
 
 /// The device and its queue. Owned by the render thread; the timeline
@@ -134,6 +136,20 @@ impl Gpu {
             if surface_caps2 {
                 exts.push(ash::khr::get_surface_capabilities2::NAME.as_ptr());
             }
+            // NGX (VSR) names the extensions it needs; they must be enabled
+            // at creation.
+            let ngx_exts = cp_nvidia::ngx_vk::required_extensions();
+            let mut ngx_ok = ngx_exts.is_some();
+            if let Some((instance_exts, _)) = &ngx_exts {
+                for e in instance_exts {
+                    if !has_ext(&available, e) {
+                        tracing::info!(ext = ?e, "NGX instance extension unavailable");
+                        ngx_ok = false;
+                    } else if !exts.iter().any(|&p| CStr::from_ptr(p) == e.as_c_str()) {
+                        exts.push(e.as_ptr());
+                    }
+                }
+            }
             let debug_layer = debug_layer && has_ext(&available, ash::ext::debug_utils::NAME);
             let validation = c"VK_LAYER_KHRONOS_validation";
             let layers: Vec<*const c_char> = if debug_layer {
@@ -196,6 +212,16 @@ impl Gpu {
 
             let dev_exts = instance.enumerate_device_extension_properties(physical)?;
             let mut enable: Vec<*const c_char> = vec![ash::khr::push_descriptor::NAME.as_ptr()];
+            if let Some((_, device_exts)) = &ngx_exts {
+                for e in device_exts {
+                    if !has_ext(&dev_exts, e) {
+                        tracing::info!(ext = ?e, "NGX device extension unavailable");
+                        ngx_ok = false;
+                    } else if !enable.iter().any(|&p| CStr::from_ptr(p) == e.as_c_str()) {
+                        enable.push(e.as_ptr());
+                    }
+                }
+            }
             if target.is_some() {
                 enable.push(ash::khr::swapchain::NAME.as_ptr());
             }
@@ -239,9 +265,14 @@ impl Gpu {
             let queues = [vk::DeviceQueueCreateInfo::default()
                 .queue_family_index(queue_family)
                 .queue_priorities(&priorities)];
+            let supported = instance.get_physical_device_features(physical);
             let base = vk::PhysicalDeviceFeatures::default()
                 .shader_storage_image_write_without_format(true)
-                .shader_storage_image_read_without_format(true);
+                .shader_storage_image_read_without_format(true)
+                // RGB10A2 storage images (VSR/VFG encodings).
+                .shader_storage_image_extended_formats(
+                    supported.shader_storage_image_extended_formats != 0,
+                );
             let mut v12 = vk::PhysicalDeviceVulkan12Features::default().timeline_semaphore(true);
             let mut v13 = vk::PhysicalDeviceVulkan13Features::default()
                 .synchronization2(true)
@@ -289,6 +320,7 @@ impl Gpu {
                     swapchain_colorspace,
                     present_timing,
                     present_at_absolute_time,
+                    ngx: ngx_ok,
                 },
                 vendor_id: props.vendor_id,
                 adapter_name,
@@ -385,6 +417,17 @@ impl Gpu {
             .memory_type_index(index);
         // SAFETY: valid allocate info for this device.
         Ok(unsafe { self.device.allocate_memory(&info, None)? })
+    }
+
+    /// The handles NGX is initialized with.
+    pub fn ngx_context(&self) -> cp_nvidia::ngx_vk::VkContext {
+        cp_nvidia::ngx_vk::VkContext {
+            instance: self.instance.handle(),
+            physical: self.physical,
+            device: self.device.handle(),
+            get_instance_proc_addr: self.entry.static_fn().get_instance_proc_addr,
+            get_device_proc_addr: self.instance.fp_v1_0().get_device_proc_addr,
+        }
     }
 
     /// Value the next submission will signal.

@@ -97,6 +97,9 @@ pub struct RecordCtx<'a> {
     pub layouts: &'a Layouts,
     pub arena: &'a mut Arena,
     pub cmd: vk::CommandBuffer,
+    /// Textures replaced while recording: destroyed once this frame's work
+    /// completed.
+    pub retire: &'a mut Vec<Texture>,
 }
 
 /// Inspection aid: stop on an interpolated frame.
@@ -314,6 +317,11 @@ impl Renderer {
         &self.gpu
     }
 
+    /// Pipeline layouts, for backends that build their own passes.
+    pub fn layouts(&self) -> &Layouts {
+        &self.layouts
+    }
+
     pub fn upload_ring(&self) -> Arc<UploadRing<VkUploadMemory>> {
         self.upload.clone()
     }
@@ -458,6 +466,7 @@ impl Renderer {
             layouts: &self.layouts,
             arena: &mut f.arena,
             cmd: f.cmd,
+            retire: &mut f.retire,
         };
         let result = up.upscale(&mut ctx, src, out);
         self.upscale_timer.end(f.cmd, self.frame_index);
@@ -1059,6 +1068,7 @@ impl Renderer {
             layouts: &self.layouts,
             arena: &mut f.arena,
             cmd: f.cmd,
+            retire: &mut f.retire,
         };
         let r = interp.interpolate(
             &mut ctx,

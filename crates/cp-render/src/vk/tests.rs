@@ -530,3 +530,86 @@ fn output_pass_letterbox_and_tone_map() {
         }
     }
 }
+
+/// RTX VSR through NGX on Vulkan, end to end: a smooth 640×360 pattern
+/// upscaled 2× must reproduce the pattern. Needs the NVIDIA Video Effects
+/// runtime (`libnvidia-ngx-vsr.so`), so it only runs on request:
+/// `CAPTUREPLAY_VFX_RUNTIME=<dir> cargo test -p cp-render vsr -- --ignored`.
+#[test]
+#[ignore = "needs the NVIDIA Video Effects runtime (CAPTUREPLAY_VFX_RUNTIME)"]
+fn vsr_ngx_upscales_a_smooth_pattern() {
+    use super::Upscaler;
+    use super::renderer::RecordCtx;
+    use super::upscale_ngx::NgxVsrUpscaler;
+
+    let Some(mut h) = Harness::new() else { return };
+    let dir = std::env::var_os("CAPTUREPLAY_VFX_RUNTIME").expect("CAPTUREPLAY_VFX_RUNTIME");
+    let dirs: Vec<std::path::PathBuf> = [
+        std::path::PathBuf::from(&dir).join("nvvfx").join("libs"),
+        std::path::PathBuf::from(&dir),
+    ]
+    .into_iter()
+    .filter(|d| cp_nvidia::ngx_vk::runtime_present(d))
+    .collect();
+    let data = std::env::temp_dir().join("captureplay-ngx-test");
+    let mut up = NgxVsrUpscaler::new(
+        &h.gpu,
+        &h.layouts,
+        dirs,
+        data,
+        cp_nvidia::ngx_vk::VsrQuality::High,
+    )
+    .expect("VSR available");
+    let (sw, sh, dw, dh) = (640u32, 360u32, 1280u32, 720u32);
+    // Smooth in both axes: the upscale has a well-defined expected value.
+    let pattern = |u: f32, v: f32| [0.2 + 1.2 * u, 0.2 + 0.8 * v, 0.6 - 0.4 * u * v];
+    let src: Vec<[f32; 4]> = (0..sh)
+        .flat_map(|y| {
+            (0..sw).map(move |x| {
+                let p = pattern((x as f32 + 0.5) / sw as f32, (y as f32 + 0.5) / sh as f32);
+                [p[0], p[1], p[2], 1.0]
+            })
+        })
+        .collect();
+    let t0 = std::time::Instant::now();
+    while !up.prepare(&h.gpu, (sw, sh), (dw, dh)) {
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(60),
+            "VSR did not load"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let tex = h.upload(sw, sh, &src);
+    let out = Texture::new(
+        &h.gpu,
+        h.cmd,
+        dw,
+        dh,
+        vk::Format::R16G16B16A16_SFLOAT,
+        WORKING_USAGE,
+    )
+    .expect("out");
+    let mut retire = Vec::new();
+    let mut ctx = RecordCtx {
+        gpu: &h.gpu,
+        layouts: &h.layouts,
+        arena: &mut h.arena,
+        cmd: h.cmd,
+        retire: &mut retire,
+    };
+    up.upscale(&mut ctx, &tex, &out).expect("upscale");
+    let got = h.readback(&out);
+    let mut err = 0.0f64;
+    for y in 8..dh - 8 {
+        for x in 8..dw - 8 {
+            let want = pattern((x as f32 + 0.5) / dw as f32, (y as f32 + 0.5) / dh as f32);
+            let g = got[(y * dw + x) as usize];
+            err += (0..3)
+                .map(|k| f64::from((g[k] - want[k]).abs()))
+                .sum::<f64>();
+        }
+    }
+    let mean = err / f64::from((dw - 16) * (dh - 16) * 3);
+    eprintln!("VSR mean abs error {mean:.4} (scRGB units)");
+    assert!(mean < 0.02, "VSR output does not match the pattern: {mean}");
+}
