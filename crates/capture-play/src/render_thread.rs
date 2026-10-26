@@ -307,6 +307,27 @@ fn vfx_runtime_dir(s: &Settings) -> std::path::PathBuf {
         .unwrap_or_else(|| exe.with_file_name("runtime").join("nvidia-vfx"))
 }
 
+/// Folders with the NVIDIA Video Effects runtime (`libnvidia-ngx-vsr.so`,
+/// VFG), in order: the configured folder, `$CAPTUREPLAY_VFX_RUNTIME`, then
+/// `runtime/nvidia-vfx` next to the executable or in any parent. Each may
+/// be the libraries folder itself or a wheel root (`nvvfx/libs`).
+#[cfg(target_os = "linux")]
+fn vfx_runtime_dirs(s: &Settings) -> Vec<std::path::PathBuf> {
+    let exe = std::env::current_exe().unwrap_or_default();
+    let mut dirs: Vec<std::path::PathBuf> = Vec::new();
+    dirs.extend(s.interpolation.vfx_runtime_dir.as_ref().map(Into::into));
+    dirs.extend(std::env::var_os("CAPTUREPLAY_VFX_RUNTIME").map(Into::into));
+    dirs.extend(
+        exe.ancestors()
+            .skip(1)
+            .map(|d| d.join("runtime").join("nvidia-vfx")),
+    );
+    dirs.into_iter()
+        .flat_map(|d| [d.join("nvvfx").join("libs"), d])
+        .filter(|d| cp_nvidia::ngx_vk::runtime_present(d))
+        .collect()
+}
+
 fn render_config(s: &Settings) -> RenderConfig {
     RenderConfig {
         vsync: s.display.vsync,
@@ -566,13 +587,32 @@ impl State {
         }
     }
 
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
     fn vsr_upscaler(
         &self,
-        _quality: cp_core::settings::VsrQualitySetting,
+        quality: cp_core::settings::VsrQualitySetting,
     ) -> Option<Box<dyn cp_render::Upscaler>> {
-        tracing::warn!("VSR is not available on this platform yet; using output-pass scaling");
-        None
+        use cp_core::settings::VsrQualitySetting;
+        use cp_nvidia::ngx_vk::VsrQuality;
+        let quality = match quality {
+            VsrQualitySetting::Low => VsrQuality::Low,
+            VsrQualitySetting::Medium => VsrQuality::Medium,
+            VsrQualitySetting::High => VsrQuality::High,
+            VsrQualitySetting::Ultra => VsrQuality::Ultra,
+        };
+        match cp_render::NgxVsrUpscaler::new(
+            self.renderer.gpu(),
+            self.renderer.layouts(),
+            vfx_runtime_dirs(&self.settings),
+            config::data_dir().join("ngx"),
+            quality,
+        ) {
+            Ok(u) => Some(Box::new(u)),
+            Err(e) => {
+                tracing::warn!("VSR unavailable, using output-pass scaling: {e}");
+                None
+            }
+        }
     }
 
     /// (Re)creates the per-frame enhancement stage when its settings changed.

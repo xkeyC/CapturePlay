@@ -34,8 +34,10 @@ mod tests;
 pub mod texture;
 pub mod timer;
 pub mod upload;
+pub mod upscale_ngx;
 
 pub use renderer::{FrameInput, Interpolator, RecordCtx, Renderer, Upscaler};
+pub use upscale_ngx::NgxVsrUpscaler;
 
 use ash::vk;
 

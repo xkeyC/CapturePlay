@@ -11,6 +11,9 @@ publish.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 
+[target.'cfg(target_os = "linux")'.dependencies]
+ash.workspace = true
+
 [target.'cfg(windows)'.dependencies]
 windows.workspace = true
 windows-core.workspace = true
