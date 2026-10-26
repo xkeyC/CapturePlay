@@ -37,6 +37,8 @@ ash-window = "0.13"
 wayland-client = "0.31"
 wayland-backend = { version = "0.3", features = ["client_system", "dlopen"] }
 wayland-protocols = { version = "0.32", features = ["client", "staging"] }
+# v0_3_49: target.object and requested buffer sizes (libpipewire ≥ 0.3.49).
+pipewire = { version = "0.10", features = ["v0_3_49"] }
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Graphics_Direct3D",

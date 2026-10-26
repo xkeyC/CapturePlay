@@ -25,11 +25,15 @@
       devShells.${system}.default = pkgs.mkShell {
         packages = with pkgs; [
           directx-shader-compiler # HLSL → SPIR-V (crates/cp-render/build.rs)
+          pkg-config
+          rustPlatform.bindgenHook # libclang + headers for pipewire-sys
           spirv-tools
           vulkan-tools
           vulkan-validation-layers
           v4l-utils
         ];
+        # Linked by cp-audio (pkg-config finds the .dev output here).
+        buildInputs = [ pkgs.pipewire ];
         DXC_PATH = "${pkgs.directx-shader-compiler}/bin/dxc";
         # /run/opengl-driver/lib: the NVIDIA driver's libcuda / NGX for VFG and VSR.
         LD_LIBRARY_PATH = "${pkgs.lib.makeLibraryPath runtimeLibs}:/run/opengl-driver/lib";
