@@ -11,5 +11,6 @@ publish.workspace = true
 name = "captureplay_nvngx"
 crate-type = ["cdylib"]
 
-[dependencies]
+# Windows-only: the community runtime is a Windows DLL.
+[target.'cfg(windows)'.dependencies]
 windows = { workspace = true }

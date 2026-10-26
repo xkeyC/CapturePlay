@@ -38,7 +38,8 @@ pub struct UiSettings {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct CaptureSettings {
-    /// Device symbolic link (stable across reboots); `None` = first device.
+    /// Device id (stable across reboots: the Media Foundation symbolic link
+    /// on Windows, the `/dev/v4l/by-id` path on Linux); `None` = first device.
     pub device: Option<String>,
     pub mode: ModeRequest,
 }

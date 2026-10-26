@@ -10,14 +10,18 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
-use cp_capture::{CaptureConfig, CaptureEvent, CaptureSession, DeviceInfo, MfThread};
+#[cfg(windows)]
+use cp_capture::MfThread;
+use cp_capture::{CaptureConfig, CaptureEvent, CaptureSession, DeviceInfo};
 use cp_core::pacing::PacingConfig;
 use cp_core::settings::{InterpolationBackend, ScalingFilter, Settings};
 use cp_core::time::HostTime;
 use cp_core::{ColorDesc, VideoMode};
 use cp_render::{EguiFrame, PresentResult, RenderConfig, Renderer};
 use crossbeam_channel::{Receiver, Sender};
+#[cfg(windows)]
 use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND};
+#[cfg(windows)]
 use windows::Win32::System::Threading::{
     CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, CreateEventW, CreateWaitableTimerExW, INFINITE,
     SetEvent, SetWaitableTimer, TIMER_ALL_ACCESS, WaitForMultipleObjects,
@@ -28,19 +32,44 @@ use crate::app::{ToMain, ToRender};
 use crate::config;
 use crate::ui::{self, Action, BackendStatus, Rates, UiView};
 
+/// The window the renderer presents to.
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy)]
+pub struct WindowTarget {
+    pub hwnd: isize,
+}
+
+/// The window the renderer presents to (Wayland or X11 handles).
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy)]
+pub struct WindowTarget {
+    pub display: raw_window_handle::RawDisplayHandle,
+    pub window: raw_window_handle::RawWindowHandle,
+}
+
+// SAFETY: the handles are plain pointers to window-system objects that
+// outlive the render thread (it is joined before the window is dropped);
+// Vulkan WSI and the renderer's Wayland queue may use them from any thread.
+#[cfg(target_os = "linux")]
+unsafe impl Send for WindowTarget {}
+
 /// Auto-reset Win32 event used to wake the render thread, plus a
 /// high-resolution waitable timer for sub-millisecond deadlines (plain
 /// wait timeouts are quantized to the 15.6 ms system tick).
+#[cfg(windows)]
 #[derive(Debug)]
 pub struct WakeEvent {
     event: HANDLE,
     timer: HANDLE,
 }
 // SAFETY: event handles may be signaled/waited from any thread.
+#[cfg(windows)]
 unsafe impl Send for WakeEvent {}
 // SAFETY: as above.
+#[cfg(windows)]
 unsafe impl Sync for WakeEvent {}
 
+#[cfg(windows)]
 impl WakeEvent {
     fn new() -> Result<Self> {
         // SAFETY: anonymous auto-reset event and high-resolution timer.
@@ -82,6 +111,7 @@ impl WakeEvent {
     }
 }
 
+#[cfg(windows)]
 impl Drop for WakeEvent {
     fn drop(&mut self) {
         // SAFETY: handles owned by self.
@@ -89,6 +119,38 @@ impl Drop for WakeEvent {
             let _ = CloseHandle(self.event);
             let _ = CloseHandle(self.timer);
         }
+    }
+}
+
+/// Auto-reset eventfd used to wake the render thread, plus an absolute
+/// `CLOCK_MONOTONIC` timerfd for sub-millisecond deadlines.
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+pub struct WakeEvent {
+    event: cp_render::vk::clock::Event,
+    timer: cp_render::vk::clock::Timer,
+}
+
+#[cfg(target_os = "linux")]
+impl WakeEvent {
+    fn new() -> Result<Self> {
+        Ok(Self {
+            event: cp_render::vk::clock::Event::new()?,
+            timer: cp_render::vk::clock::Timer::new()?,
+        })
+    }
+
+    pub fn set(&self) {
+        self.event.set();
+    }
+
+    /// Waits until signaled or `timeout` elapsed (sub-ms accurate).
+    fn wait(&self, timeout: Duration) {
+        if timeout.is_zero() {
+            return;
+        }
+        let deadline = HostTime::now().0 + timeout.as_nanos() as i64;
+        let _ = cp_render::vk::clock::wait_event_until(&self.timer, &self.event, deadline);
     }
 }
 
@@ -114,7 +176,7 @@ impl RenderHandle {
 }
 
 pub fn spawn(
-    hwnd: isize,
+    target: WindowTarget,
     size: (u32, u32),
     ctx: egui::Context,
     settings: Settings,
@@ -126,7 +188,7 @@ pub fn spawn(
     let thread = std::thread::Builder::new()
         .name("render".into())
         .spawn(move || {
-            if let Err(e) = run(hwnd, size, ctx, settings, rx, wake2, proxy.clone()) {
+            if let Err(e) = run(target, size, ctx, settings, rx, wake2, proxy.clone()) {
                 tracing::error!("render thread failed: {e:#}");
                 let _ = proxy.send_event(ToMain::Exit);
             }
@@ -138,6 +200,7 @@ pub fn spawn(
     })
 }
 
+#[cfg(windows)]
 /// Folders searched for the RTX Video SDK feature DLL (`nvngx_vsr.dll`), in
 /// order: `$CAPTUREPLAY_RTX_VIDEO_RUNTIME`, the executable's folder, then
 /// `runtime/rtx-video-sdk/bin/Windows/x64/rel` next to the executable or in
@@ -161,6 +224,7 @@ fn rtx_video_dirs() -> Vec<std::path::PathBuf> {
     dirs
 }
 
+#[cfg(windows)]
 /// Folders searched for `nvngx_dlssnr.dll` (DLSS Neural Rendering), in
 /// order: the configured folder, `$CAPTUREPLAY_NR_RUNTIME`, the executable's
 /// folder, then `runtime/nvidia-nr` next to the executable or in any parent.
@@ -180,6 +244,7 @@ fn nr_runtime_dirs(s: &Settings) -> Vec<std::path::PathBuf> {
     dirs
 }
 
+#[cfg(windows)]
 /// The CapturePlay forwarding host used by the community NR backend.
 fn nr_bridge_path() -> Option<std::path::PathBuf> {
     if let Some(p) = std::env::var_os("CAPTUREPLAY_NR_BRIDGE") {
@@ -199,6 +264,7 @@ fn nr_bridge_path() -> Option<std::path::PathBuf> {
     candidates.into_iter().find(|p| p.is_file())
 }
 
+#[cfg(windows)]
 /// Every folder NGX may load a feature DLL from. NGX is initialized once per
 /// process with this list, so both features must be named here even when only
 /// one of them is enabled.
@@ -208,6 +274,7 @@ fn ngx_feature_dirs(s: &Settings) -> Vec<std::path::PathBuf> {
     dirs
 }
 
+#[cfg(windows)]
 /// Live DLSS NR model tuning (read at every evaluation).
 fn nr_tuning(s: &cp_core::settings::EnhanceSettings) -> cp_nvidia::ngx::NrTuning {
     cp_nvidia::ngx::NrTuning {
@@ -221,6 +288,7 @@ fn nr_tuning(s: &cp_core::settings::EnhanceSettings) -> cp_nvidia::ngx::NrTuning
     }
 }
 
+#[cfg(windows)]
 /// Where the NVIDIA Video Effects runtime DLLs (VFG) are looked up.
 fn vfx_runtime_dir(s: &Settings) -> std::path::PathBuf {
     if let Some(d) = &s.interpolation.vfx_runtime_dir {
@@ -328,7 +396,7 @@ impl State {
         let wanted = self.settings.capture.device.as_ref();
         self.devices
             .iter()
-            .find(|d| Some(&d.symbolic_link) == wanted)
+            .find(|d| Some(&d.id) == wanted)
             .or_else(|| self.devices.iter().find(|d| !d.name.contains("Virtual")))
             .cloned()
     }
@@ -423,62 +491,88 @@ impl State {
         }
         self.interp_backend = Some(want);
         let want = want.0;
-        let interp: Option<Box<dyn cp_render::Interpolator>> = match want {
+        let interp = match want {
             InterpolationBackend::Off => None,
-            InterpolationBackend::NvidiaVfg => {
-                let dir = vfx_runtime_dir(&self.settings);
-                match cp_render::VfgInterpolator::new(
-                    self.renderer.gpu(),
-                    dir,
-                    self.settings.interpolation.vfg_quality,
-                ) {
-                    Ok(i) => Some(Box::new(i)),
-                    Err(e) => {
-                        tracing::warn!("VFG interpolation unavailable: {e}");
-                        None
-                    }
-                }
-            }
+            InterpolationBackend::NvidiaVfg => self.vfg_interpolator(),
         };
         self.renderer.set_interpolator(interp);
     }
 
+    #[cfg(windows)]
+    fn vfg_interpolator(&self) -> Option<Box<dyn cp_render::Interpolator>> {
+        let dir = vfx_runtime_dir(&self.settings);
+        match cp_render::VfgInterpolator::new(
+            self.renderer.gpu(),
+            dir,
+            self.settings.interpolation.vfg_quality,
+        ) {
+            Ok(i) => Some(Box::new(i)),
+            Err(e) => {
+                tracing::warn!("VFG interpolation unavailable: {e}");
+                None
+            }
+        }
+    }
+
+    #[cfg(not(windows))]
+    fn vfg_interpolator(&self) -> Option<Box<dyn cp_render::Interpolator>> {
+        tracing::warn!("VFG interpolation is not available on this platform yet");
+        None
+    }
+
     /// (Re)creates the upscaler when its settings changed.
     fn apply_upscaler(&mut self) {
-        use cp_core::settings::{UpscaleBackend, VsrQualitySetting};
-        use cp_nvidia::ngx::VsrQuality;
+        use cp_core::settings::UpscaleBackend;
         let want = self.settings.upscale;
         if self.upscale_backend == Some(want) {
             return;
         }
         self.upscale_backend = Some(want);
-        let upscaler: Option<Box<dyn cp_render::Upscaler>> = match want.backend {
+        let upscaler = match want.backend {
             UpscaleBackend::Off => None,
-            UpscaleBackend::NvidiaVsr => {
-                let quality = match want.vsr_quality {
-                    VsrQualitySetting::Low => VsrQuality::Low,
-                    VsrQualitySetting::Medium => VsrQuality::Medium,
-                    VsrQualitySetting::High => VsrQuality::High,
-                    VsrQualitySetting::Ultra => VsrQuality::Ultra,
-                };
-                match cp_render::NgxVsrUpscaler::new(
-                    self.renderer.gpu(),
-                    ngx_feature_dirs(&self.settings),
-                    config::data_dir().join("ngx"),
-                    quality,
-                ) {
-                    Ok(u) => Some(Box::new(u)),
-                    Err(e) => {
-                        tracing::warn!("VSR unavailable, using output-pass scaling: {e}");
-                        None
-                    }
-                }
-            }
+            UpscaleBackend::NvidiaVsr => self.vsr_upscaler(want.vsr_quality),
         };
         self.renderer.set_upscaler(upscaler);
     }
 
+    #[cfg(windows)]
+    fn vsr_upscaler(
+        &self,
+        quality: cp_core::settings::VsrQualitySetting,
+    ) -> Option<Box<dyn cp_render::Upscaler>> {
+        use cp_core::settings::VsrQualitySetting;
+        use cp_nvidia::ngx::VsrQuality;
+        let quality = match quality {
+            VsrQualitySetting::Low => VsrQuality::Low,
+            VsrQualitySetting::Medium => VsrQuality::Medium,
+            VsrQualitySetting::High => VsrQuality::High,
+            VsrQualitySetting::Ultra => VsrQuality::Ultra,
+        };
+        match cp_render::NgxVsrUpscaler::new(
+            self.renderer.gpu(),
+            ngx_feature_dirs(&self.settings),
+            config::data_dir().join("ngx"),
+            quality,
+        ) {
+            Ok(u) => Some(Box::new(u)),
+            Err(e) => {
+                tracing::warn!("VSR unavailable, using output-pass scaling: {e}");
+                None
+            }
+        }
+    }
+
+    #[cfg(not(windows))]
+    fn vsr_upscaler(
+        &self,
+        _quality: cp_core::settings::VsrQualitySetting,
+    ) -> Option<Box<dyn cp_render::Upscaler>> {
+        tracing::warn!("VSR is not available on this platform yet; using output-pass scaling");
+        None
+    }
+
     /// (Re)creates the per-frame enhancement stage when its settings changed.
+    #[cfg(windows)]
     fn apply_enhancer(&mut self) {
         use cp_core::settings::EnhanceBackend;
         let want = self.settings.enhance.clone();
@@ -541,6 +635,21 @@ impl State {
             },
         };
         self.renderer.set_enhancer(enhancer);
+    }
+
+    /// DLSS NR has no backend on this platform; the setting is kept.
+    #[cfg(not(windows))]
+    fn apply_enhancer(&mut self) {
+        let want = self.settings.enhance.clone();
+        if want.backend != cp_core::settings::EnhanceBackend::Off
+            && self
+                .enhance_backend
+                .as_ref()
+                .is_none_or(|p| p.backend != want.backend)
+        {
+            tracing::warn!("DLSS NR is not available on this platform");
+        }
+        self.enhance_backend = Some(want);
     }
 
     fn apply_settings(&mut self) {
@@ -631,7 +740,7 @@ fn merge_input(acc: &mut Option<egui::RawInput>, new: egui::RawInput) {
 
 #[allow(clippy::too_many_lines)]
 fn run(
-    hwnd: isize,
+    target: WindowTarget,
     size: (u32, u32),
     ctx: egui::Context,
     settings: Settings,
@@ -639,13 +748,26 @@ fn run(
     wake: Arc<WakeEvent>,
     proxy: EventLoopProxy<ToMain>,
 ) -> Result<()> {
+    #[cfg(windows)]
     let _mf = MfThread::init().context("Media Foundation init")?;
-    let hwnd = HWND(hwnd as *mut _);
     let wake_capture = wake.clone();
-    let renderer = Renderer::new(hwnd, size, render_config(&settings), move || {
-        wake_capture.set()
-    })
-    .context("renderer init")?;
+    let wake_fn = move || wake_capture.set();
+    #[cfg(windows)]
+    let renderer = Renderer::new(
+        HWND(target.hwnd as *mut _),
+        size,
+        render_config(&settings),
+        wake_fn,
+    );
+    #[cfg(target_os = "linux")]
+    let renderer = Renderer::new(
+        target.display,
+        target.window,
+        size,
+        render_config(&settings),
+        wake_fn,
+    );
+    let renderer = renderer.context("renderer init")?;
     ui::install_fonts(&ctx);
     let (capture_tx, capture_rx) = crossbeam_channel::unbounded();
     let mut st = State {
@@ -728,6 +850,13 @@ fn run(
                 }
                 ToRender::DisplayChanged => {
                     st.renderer.invalidate_display();
+                    force = true;
+                }
+                // Windows queries the display itself (DXGI/DisplayConfig).
+                #[cfg_attr(windows, allow(unused_variables))]
+                ToRender::Monitor { name, refresh_hz } => {
+                    #[cfg(target_os = "linux")]
+                    st.renderer.set_monitor(name, refresh_hz);
                     force = true;
                 }
                 ToRender::Input(i) => merge_input(&mut pending_input, i),
@@ -867,10 +996,13 @@ fn run(
         let result = st.renderer.step(ui_frame, force);
         pending_delta.clear();
         match result? {
+            #[cfg(windows)]
             PresentResult::DeviceLost => anyhow::bail!(
                 "GPU device lost (reason {:?})",
                 st.renderer.gpu().removed_reason()
             ),
+            #[cfg(not(windows))]
+            PresentResult::DeviceLost => anyhow::bail!("GPU device lost"),
             PresentResult::Occluded | PresentResult::Ok => {}
         }
     }

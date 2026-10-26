@@ -6,9 +6,10 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+#[cfg(windows)]
+use cp_capture::MfThread;
 use cp_capture::{
-    CaptureConfig, CaptureEvent, CaptureSession, FrameDest, FrameMeta, FrameSink, MfThread,
-    PlaneDest,
+    CaptureConfig, CaptureEvent, CaptureSession, FrameDest, FrameMeta, FrameSink, PlaneDest,
 };
 use cp_core::VideoMode;
 use cp_core::cadence::{CadenceConfig, CadenceTracker};
@@ -87,12 +88,15 @@ impl FrameSink for CpuSink {
 }
 
 fn main() -> anyhow::Result<()> {
-    eprintln!("init MF");
-    let _mf = MfThread::init()?;
+    #[cfg(windows)]
+    let _mf = {
+        eprintln!("init MF");
+        MfThread::init()?
+    };
     eprintln!("enumerating");
     let devices = cp_capture::list_devices()?;
     for d in &devices {
-        println!("{}  [{}]", d.name, d.symbolic_link);
+        println!("{}  [{}]", d.name, d.id);
     }
     let dev = devices
         .iter()

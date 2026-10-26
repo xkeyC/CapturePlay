@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use cp_core::settings::Settings;
-use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+use raw_window_handle::HasWindowHandle;
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
@@ -29,6 +29,11 @@ pub enum ToRender {
     Resized(u32, u32),
     /// Window moved or display configuration changed: re-query the display.
     DisplayChanged,
+    /// Output under the window, as the window system reports it.
+    Monitor {
+        name: String,
+        refresh_hz: f64,
+    },
     Input(egui::RawInput),
     ToggleOverlay,
     ToggleFreeze,
@@ -47,6 +52,8 @@ struct App {
     /// over the overlay.
     egui_ctx: Option<egui::Context>,
     cursor: CursorIdle,
+    /// Last output reported to the render thread (name, refresh Hz).
+    monitor: Option<(String, f64)>,
 }
 
 impl App {
@@ -61,6 +68,28 @@ impl App {
             w.set_fullscreen(on.then_some(Fullscreen::Borderless(None)));
             self.send(ToRender::FullscreenChanged(on));
         }
+    }
+
+    /// Reports the output under the window (name, refresh rate) when it
+    /// changed. On Wayland it is only known once the surface entered an
+    /// output, after the first frame, so this runs after every event batch.
+    fn send_monitor(&mut self) {
+        let Some(m) = self.window.as_ref().and_then(|w| w.current_monitor()) else {
+            return;
+        };
+        let current = (
+            m.name().unwrap_or_default(),
+            m.refresh_rate_millihertz()
+                .map_or(0.0, |r| f64::from(r) / 1000.0),
+        );
+        if self.monitor.as_ref() == Some(&current) {
+            return;
+        }
+        self.monitor = Some(current.clone());
+        self.send(ToRender::Monitor {
+            name: current.0,
+            refresh_hz: current.1,
+        });
     }
 
     fn is_fullscreen(&self) -> bool {
@@ -125,13 +154,10 @@ impl ApplicationHandler<ToMain> for App {
                 return;
             }
         };
-        let hwnd = match window.window_handle().map(|h| h.as_raw()) {
-            Ok(RawWindowHandle::Win32(h)) => h.hwnd.get(),
-            _ => {
-                tracing::error!("not a Win32 window");
-                event_loop.exit();
-                return;
-            }
+        let Some(target) = window_target(&window) else {
+            tracing::error!("unsupported window system handle");
+            event_loop.exit();
+            return;
         };
         let ctx = egui::Context::default();
         let ctx_for_cursor = ctx.clone();
@@ -146,7 +172,7 @@ impl ApplicationHandler<ToMain> for App {
         let size = window.inner_size();
         let fullscreen = settings.display.start_fullscreen;
         match render_thread::spawn(
-            hwnd,
+            target,
             (size.width, size.height),
             ctx,
             settings,
@@ -168,6 +194,7 @@ impl ApplicationHandler<ToMain> for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        self.send_monitor();
         self.update_cursor(event_loop);
     }
 
@@ -273,6 +300,24 @@ impl App {
     }
 }
 
+#[cfg(windows)]
+fn window_target(window: &Window) -> Option<render_thread::WindowTarget> {
+    use raw_window_handle::RawWindowHandle;
+    match window.window_handle().ok()?.as_raw() {
+        RawWindowHandle::Win32(h) => Some(render_thread::WindowTarget { hwnd: h.hwnd.get() }),
+        _ => None,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn window_target(window: &Window) -> Option<render_thread::WindowTarget> {
+    use raw_window_handle::HasDisplayHandle;
+    Some(render_thread::WindowTarget {
+        display: window.display_handle().ok()?.as_raw(),
+        window: window.window_handle().ok()?.as_raw(),
+    })
+}
+
 impl std::fmt::Debug for ToMain {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -294,6 +339,7 @@ pub fn run(settings: Settings) -> Result<()> {
         last_click: None,
         egui_ctx: None,
         cursor: CursorIdle::new(Instant::now()),
+        monitor: None,
     };
     event_loop.run_app(&mut app)?;
     Ok(())

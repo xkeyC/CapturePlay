@@ -73,22 +73,74 @@ pub struct Rates {
 
 /// Loads Microsoft YaHei (if present) as a fallback font for CJK text.
 pub fn install_fonts(ctx: &egui::Context) {
-    let Ok(bytes) = std::fs::read(r"C:\Windows\Fonts\msyh.ttc") else {
+    let Some((bytes, index)) = ui_font() else {
+        tracing::warn!("no UI font with Chinese glyphs found; text will not render");
         return;
     };
     let mut fonts = egui::FontDefinitions::default();
     fonts.font_data.insert(
-        "yahei".into(),
-        std::sync::Arc::new(egui::FontData::from_owned(bytes)),
+        "ui".into(),
+        std::sync::Arc::new(egui::FontData {
+            index,
+            ..egui::FontData::from_owned(bytes)
+        }),
     );
     for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
-        fonts
-            .families
-            .entry(family)
-            .or_default()
-            .push("yahei".into());
+        fonts.families.entry(family).or_default().push("ui".into());
     }
     ctx.set_fonts(fonts);
+}
+
+/// Microsoft YaHei: Chinese and Latin in one face.
+#[cfg(windows)]
+fn ui_font() -> Option<(Vec<u8>, u32)> {
+    Some((std::fs::read(r"C:\Windows\Fonts\msyh.ttc").ok()?, 0))
+}
+
+/// The best regular sans face covering Simplified Chinese per fontconfig
+/// (e.g. Noto Sans CJK SC), with its index inside a font collection.
+#[cfg(not(windows))]
+fn ui_font() -> Option<(Vec<u8>, u32)> {
+    let out = std::process::Command::new("fc-list")
+        .args([
+            ":lang=zh-cn",
+            "--format=%{file}|%{index}|%{family}|%{style}\n",
+        ])
+        .output()
+        .ok()?;
+    let list = String::from_utf8_lossy(&out.stdout);
+    let (_, file, index) = list
+        .lines()
+        .filter_map(|l| {
+            let mut f = l.splitn(4, '|');
+            let (file, index, family, style) = (f.next()?, f.next()?, f.next()?, f.next()?);
+            Some((font_score(family, style), file, index.parse::<u32>().ok()?))
+        })
+        .max_by_key(|&(score, _, _)| score)?;
+    // fontconfig packs the named instance of variable fonts into the high
+    // bits; the face index within the collection is the low 16.
+    Some((std::fs::read(file).ok()?, index & 0xffff))
+}
+
+/// Prefers sans over serif/mono, Simplified Chinese variants and regular
+/// weight.
+#[cfg(not(windows))]
+fn font_score(family: &str, style: &str) -> i32 {
+    let f = family.to_ascii_lowercase();
+    let first_style = style.split(',').next().unwrap_or("").to_ascii_lowercase();
+    let mut s = 0;
+    s += if f.contains("serif") || f.contains("mono") {
+        0
+    } else {
+        8
+    };
+    s += if f.contains(" sc") || f.contains(" cn") || f.contains("hans") {
+        4
+    } else {
+        0
+    };
+    s += if first_style == "regular" { 2 } else { 0 };
+    s
 }
 
 fn transfer_label(t: &Strings, tf: Option<TransferFunction>) -> &'static str {
@@ -171,12 +223,12 @@ pub fn draw(ctx: &egui::Context, s: &mut Settings, v: &UiView<'_>) -> Vec<Action
             egui::CollapsingHeader::new(t.source).default_open(true).show(ui, |ui| {
                 grid("source").show(ui, |ui| {
                     let cur_dev = s.capture.device.clone();
-                    let dev_name = v.devices.iter().find(|d| Some(&d.symbolic_link) == cur_dev.as_ref()).map_or(t.device_auto, |d| d.name.as_str());
+                    let dev_name = v.devices.iter().find(|d| Some(&d.id) == cur_dev.as_ref()).map_or(t.device_auto, |d| d.name.as_str());
                     row(ui, t.device, None, |ui| {
                         egui::ComboBox::from_id_salt("device").selected_text(dev_name).width(230.0).show_ui(ui, |ui| {
                             for d in v.devices {
-                                if ui.selectable_label(Some(&d.symbolic_link) == cur_dev.as_ref(), &d.name).clicked() {
-                                    actions.push(Action::SelectDevice(d.symbolic_link.clone()));
+                                if ui.selectable_label(Some(&d.id) == cur_dev.as_ref(), &d.name).clicked() {
+                                    actions.push(Action::SelectDevice(d.id.clone()));
                                 }
                             }
                         });

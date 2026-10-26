@@ -8,6 +8,7 @@ use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::core::Result;
 
+use crate::common::DecodeParams;
 use crate::descriptors::{GpuDescriptorRing, StagingHeap};
 use crate::gpu::{Gpu, borrow_com};
 use crate::shaders::{self, ComputePipeline, dispatch_2d, set_compute_constants};
@@ -29,15 +30,6 @@ struct Constants {
     pad0: u32,
     chroma_texel: [f32; 2],
     pad1: [f32; 2],
-}
-
-/// Display-dependent parameters of the decode.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct DecodeParams {
-    /// Nits at which SDR white is placed.
-    pub sdr_white_nits: f32,
-    /// Display peak used for the HLG OOTF.
-    pub hlg_peak_nits: f32,
 }
 
 struct PlaneTextures {

@@ -1,13 +1,15 @@
 //! Host clock shared by capture, audio and presentation.
 //!
-//! All timestamps are nanoseconds on the QueryPerformanceCounter timeline, so
-//! they compare directly with DXGI frame statistics and WASAPI positions.
+//! All timestamps are nanoseconds on the platform's presentation clock, so
+//! they compare directly with the OS timestamps of the other subsystems:
+//! the QueryPerformanceCounter timeline on Windows (DXGI frame statistics,
+//! WASAPI positions), `CLOCK_MONOTONIC` on Unix (V4L2 buffer timestamps,
+//! Vulkan present timing).
 
 use std::ops::{Add, Sub};
-use std::sync::OnceLock;
 use std::time::Duration;
 
-/// Nanoseconds on the host QPC timeline.
+/// Nanoseconds on the host clock (QPC on Windows, `CLOCK_MONOTONIC` on Unix).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct HostTime(pub i64);
 
@@ -17,6 +19,7 @@ impl HostTime {
     }
 
     /// Converts a raw QPC tick count (e.g. `DXGI_FRAME_STATISTICS::SyncQPCTime`).
+    /// On Unix the host clock already counts nanoseconds.
     pub fn from_qpc(ticks: i64) -> Self {
         let freq = qpc::frequency();
         Self(((i128::from(ticks) * 1_000_000_000) / i128::from(freq)) as i64)
@@ -61,7 +64,7 @@ impl Sub for HostTime {
 
 #[cfg(windows)]
 mod qpc {
-    use super::OnceLock;
+    use std::sync::OnceLock;
 
     #[link(name = "kernel32")]
     unsafe extern "system" {
@@ -87,15 +90,19 @@ mod qpc {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(unix)]
 mod qpc {
-    use super::OnceLock;
-    use std::time::Instant;
-
-    static EPOCH: OnceLock<Instant> = OnceLock::new();
-
+    /// `CLOCK_MONOTONIC` in nanoseconds: the clock V4L2 stamps buffers with
+    /// and the default Vulkan present-timing domain.
+    #[allow(clippy::unnecessary_cast, reason = "time_t is 32-bit on some targets")]
     pub fn counter() -> i64 {
-        EPOCH.get_or_init(Instant::now).elapsed().as_nanos() as i64
+        let mut ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: valid out pointer; CLOCK_MONOTONIC always exists.
+        unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+        ts.tv_sec as i64 * 1_000_000_000 + ts.tv_nsec as i64
     }
 
     pub fn frequency() -> i64 {

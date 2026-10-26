@@ -94,10 +94,34 @@ pub unsafe fn copy_frame(
     Ok(FrameSignature::from_plane(width, height, read))
 }
 
+/// Rows in plane 0 including driver padding (e.g. 1088 for 1080p NV12),
+/// derived from the total buffer size when it matches exactly.
+pub fn plane0_rows(total: usize, pitch: usize, height: usize, plane_count: usize) -> usize {
+    if plane_count < 2 || pitch == 0 {
+        return height;
+    }
+    [
+        height,
+        height.next_multiple_of(16),
+        height.next_multiple_of(32),
+        height.next_multiple_of(64),
+    ]
+    .into_iter()
+    .find(|&rows| rows * pitch + rows.div_ceil(2) * pitch == total)
+    .unwrap_or(height)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::sink::PlaneDest;
+
+    #[test]
+    fn padded_plane_rows() {
+        assert_eq!(plane0_rows(1920 * 1088 * 3 / 2, 1920, 1080, 2), 1088);
+        assert_eq!(plane0_rows(1920 * 1080 * 3 / 2, 1920, 1080, 2), 1080);
+        assert_eq!(plane0_rows(1920 * 1080 * 2 + 77, 1920, 1080, 2), 1080);
+    }
 
     #[test]
     fn copies_padded_nv12_into_aligned_dest() {

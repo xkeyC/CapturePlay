@@ -1,5 +1,5 @@
-//! Resolves the signal's color description from Media Foundation attributes,
-//! user overrides and capture-card realities.
+//! Resolves the signal's color description from Media Foundation attributes
+//! or V4L2 format fields, user overrides and capture-card realities.
 //!
 //! Capture drivers routinely mislabel HDR: the AVerMedia Live Gamer Ultra 2.1
 //! for example tags its P010 modes as BT.709. Consoles only emit 10-bit over
@@ -52,6 +52,39 @@ impl DetectedColor {
                 2 => Some(Range::Limited),
                 _ => None,
             }),
+        }
+    }
+
+    /// Maps raw `v4l2_pix_format` `colorspace`, `xfer_func`, `ycbcr_enc` and
+    /// `quantization` values; 0 (`*_DEFAULT`) means not reported.
+    ///
+    /// Only explicit fields count. The V4L2 defaults derived from
+    /// `colorspace` would mislead here: uvcvideo reports BT.709 primaries as
+    /// `V4L2_COLORSPACE_SRGB`, whose default encoding is BT.601.
+    pub fn from_v4l2(colorspace: u32, xfer_func: u32, ycbcr_enc: u32, quantization: u32) -> Self {
+        Self {
+            transfer: match xfer_func {
+                1 => Some(TransferFunction::Bt1886), // 709
+                2 => Some(TransferFunction::Srgb),
+                7 => Some(TransferFunction::Pq), // SMPTE2084
+                _ => None,
+            },
+            primaries: match colorspace {
+                3 | 8 => Some(Primaries::Bt709), // REC709, SRGB
+                10 => Some(Primaries::Bt2020),
+                _ => None,
+            },
+            matrix: match ycbcr_enc {
+                1 | 3 => Some(YuvMatrix::Bt601), // 601, XV601
+                2 | 4 => Some(YuvMatrix::Bt709), // 709, XV709
+                6 => Some(YuvMatrix::Bt2020Ncl),
+                _ => None,
+            },
+            range: match quantization {
+                1 => Some(Range::Full),
+                2 => Some(Range::Limited),
+                _ => None,
+            },
         }
     }
 }
@@ -113,6 +146,21 @@ mod tests {
         let det = DetectedColor::from_mf(None, Some(2), Some(1), Some(2));
         let c = resolve(det, &ColorSettings::new(), PixelFormat::P010, 1440);
         assert_eq!(c, ColorDesc::HDR10);
+    }
+
+    #[test]
+    fn v4l2_fields() {
+        // uvcvideo: BT.709 primaries as SRGB, 709 transfer/matrix, P010 → HDR10.
+        let det = DetectedColor::from_v4l2(8, 1, 2, 0);
+        assert_eq!(det.matrix, Some(YuvMatrix::Bt709));
+        let c = resolve(det, &ColorSettings::new(), PixelFormat::P010, 1440);
+        assert_eq!(c, ColorDesc::HDR10);
+        let det = DetectedColor::from_v4l2(10, 7, 6, 2);
+        assert_eq!(det.transfer, Some(TransferFunction::Pq));
+        assert_eq!(
+            DetectedColor::from_v4l2(0, 0, 0, 0),
+            DetectedColor::default()
+        );
     }
 
     #[test]

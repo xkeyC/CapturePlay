@@ -11,6 +11,9 @@ publish.workspace = true
 serde.workspace = true
 bytemuck.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
 [dev-dependencies]
 toml.workspace = true
 

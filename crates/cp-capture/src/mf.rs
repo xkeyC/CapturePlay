@@ -41,21 +41,22 @@ impl Drop for MfThread {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeviceInfo {
     pub name: String,
-    /// Stable identifier (`\\?\usb#vid_...`), used to reopen the device.
-    pub symbolic_link: String,
+    /// Stable identifier, used to reopen the device and kept in settings:
+    /// the Media Foundation symbolic link (`\\?\usb#vid_...`).
+    pub id: String,
 }
 
 impl DeviceInfo {
     /// USB vendor id parsed from the symbolic link, if any.
     pub fn usb_vendor_id(&self) -> Option<u16> {
-        let lower = self.symbolic_link.to_ascii_lowercase();
+        let lower = self.id.to_ascii_lowercase();
         let i = lower.find("vid_")?;
         u16::from_str_radix(lower.get(i + 4..i + 8)?, 16).ok()
     }
 
     /// PCI vendor id parsed from the symbolic link, if any.
     pub fn pci_vendor_id(&self) -> Option<u16> {
-        let lower = self.symbolic_link.to_ascii_lowercase();
+        let lower = self.id.to_ascii_lowercase();
         let i = lower.find("ven_")?;
         u16::from_str_radix(lower.get(i + 4..i + 8)?, 16).ok()
     }
@@ -105,10 +106,7 @@ pub fn list_devices() -> windows::core::Result<Vec<DeviceInfo>> {
                     &act.cast()?,
                     &MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_SYMBOLIC_LINK,
                 ) {
-                    out.push(DeviceInfo {
-                        name,
-                        symbolic_link: link,
-                    });
+                    out.push(DeviceInfo { name, id: link });
                 }
             }
         }
@@ -120,7 +118,7 @@ pub fn list_devices() -> windows::core::Result<Vec<DeviceInfo>> {
 /// Opens a device by symbolic link with a bounded driver queue.
 pub fn open_source(dev: &DeviceInfo, max_buffers: u32) -> windows::core::Result<IMFMediaSource> {
     let attrs = video_capture_attributes(3)?;
-    let link: Vec<u16> = dev.symbolic_link.encode_utf16().chain(Some(0)).collect();
+    let link: Vec<u16> = dev.id.encode_utf16().chain(Some(0)).collect();
     // SAFETY: `link` outlives the SetString call (MF copies it).
     unsafe {
         attrs.SetString(
@@ -238,7 +236,7 @@ mod tests {
     fn vendor_ids_from_links() {
         let d = DeviceInfo {
             name: "x".into(),
-            symbolic_link: r"\\?\usb#vid_07ca&pid_2553&mi_00#7&1ca8ca21&0&0000#{65e8773d}".into(),
+            id: r"\\?\usb#vid_07ca&pid_2553&mi_00#7&1ca8ca21&0&0000#{65e8773d}".into(),
         };
         assert_eq!(d.usb_vendor_id(), Some(0x07ca));
         assert_eq!(d.pci_vendor_id(), None);

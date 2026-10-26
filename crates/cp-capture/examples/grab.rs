@@ -8,9 +8,10 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+#[cfg(windows)]
+use cp_capture::MfThread;
 use cp_capture::{
-    CaptureConfig, CaptureEvent, CaptureSession, FrameDest, FrameMeta, FrameSink, MfThread,
-    PlaneDest,
+    CaptureConfig, CaptureEvent, CaptureSession, FrameDest, FrameMeta, FrameSink, PlaneDest,
 };
 use cp_core::VideoMode;
 use cp_core::format::ModeRequest;
@@ -90,6 +91,7 @@ fn main() -> anyhow::Result<()> {
         ModeRequest::default()
     };
     let want = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(1);
+    #[cfg(windows)]
     let _mf = MfThread::init()?;
     let dev = cp_capture::list_devices()?
         .into_iter()

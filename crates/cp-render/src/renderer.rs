@@ -15,9 +15,8 @@
 use std::rc::Rc;
 use std::sync::Arc;
 
-use cp_core::VideoMode;
 use cp_core::cadence::{CadenceConfig, CadenceTracker};
-use cp_core::pacing::{DelayEstimator, FrameRef, Pacer, PacingConfig, Planned, Refresh, Slot};
+use cp_core::pacing::{DelayEstimator, FrameRef, Pacer, Planned, Refresh, Slot};
 use cp_core::retime::Retimer;
 use cp_core::settings::RefreshMode;
 use cp_core::time::HostTime;
@@ -28,15 +27,19 @@ use windows::core::Result;
 
 use crate::arena::UploadArena;
 use crate::clock::PreciseSleep;
-use crate::convert::{ConvertPass, DecodeParams};
+use crate::common::{
+    DecodeParams, EguiFrame, OutputParams, PresentResult, RenderConfig, RenderStats, UpscaleTarget,
+    slack_ns,
+};
+use crate::convert::ConvertPass;
 use crate::descriptors::{GpuDescriptorRing, StagingHeap};
-use crate::egui_pass::{EguiFrame, EguiPass};
+use crate::egui_pass::EguiPass;
 use crate::gpu::{Gpu, transition};
-use crate::output::{OutputParams, OutputPass};
+use crate::output::OutputPass;
 use crate::present_timing::{PresentTiming, RefreshKind};
-use crate::presenter::{PresentResult, Presenter};
+use crate::presenter::Presenter;
 use crate::texture::{Texture, TextureDesc};
-use crate::upload::UploadRing;
+use crate::upload::{D3d12UploadMemory, UploadRing};
 
 const FRAMES_IN_FLIGHT: usize = 2;
 const WORKING_FORMAT: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT =
@@ -47,36 +50,6 @@ const WORKING_FORMAT: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT =
 const OFFSET_DECAY_NS: i64 = 50_000;
 /// Unique source frames kept on the GPU (pair being interpolated + spares).
 const FRAME_POOL: usize = 4;
-
-/// User-facing renderer options (subset of the app settings).
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct RenderConfig {
-    pub vsync: bool,
-    pub catmull_rom: bool,
-    /// Mastering peak assumed for HDR content (nits).
-    pub hdr_content_peak_nits: f32,
-    pub sdr_white_override: Option<f32>,
-    pub peak_override: Option<f32>,
-    pub pacing: PacingConfig,
-    pub refresh: RefreshMode,
-    /// Reconstruct even content timing (see [`cp_core::retime`]).
-    pub retime: bool,
-}
-
-impl Default for RenderConfig {
-    fn default() -> Self {
-        Self {
-            vsync: true,
-            catmull_rom: true,
-            hdr_content_peak_nits: 1000.0,
-            sdr_white_override: None,
-            peak_override: None,
-            pacing: PacingConfig::default(),
-            refresh: RefreshMode::Auto,
-            retime: true,
-        }
-    }
-}
 
 /// Interpolation backend plugged into the renderer.
 pub trait Interpolator {
@@ -163,51 +136,6 @@ pub trait Upscaler {
     fn upscale(&mut self, ctx: &mut RecordCtx<'_>, src: &Texture, out: &Texture) -> Result<()>;
 }
 
-/// Display-driven target changes (window resize) apply after this long, so
-/// a window drag does not rebuild the upscaler on every step.
-const UPSCALE_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(300);
-
-/// Debounced choice of the upscaled working size.
-#[derive(Debug, Default)]
-struct UpscaleTarget {
-    src: Option<(u32, u32)>,
-    current: Option<(u32, u32)>,
-    pending: Option<(Option<(u32, u32)>, std::time::Instant)>,
-}
-
-impl UpscaleTarget {
-    /// Returns the target to use now and whether it changed.
-    fn update(
-        &mut self,
-        src: (u32, u32),
-        desired: Option<(u32, u32)>,
-    ) -> (Option<(u32, u32)>, bool) {
-        let source_changed = self.src != Some(src);
-        if desired == self.current && !source_changed {
-            self.pending = None;
-            return (self.current, false);
-        }
-        let now = std::time::Instant::now();
-        let apply = source_changed
-            || match self.pending {
-                Some((p, since)) if p == desired => now - since >= UPSCALE_DEBOUNCE,
-                _ => {
-                    self.pending = Some((desired, now));
-                    false
-                }
-            };
-        if apply {
-            let changed = self.current != desired;
-            self.src = Some(src);
-            self.current = desired;
-            self.pending = None;
-            (desired, changed)
-        } else {
-            (self.current, false)
-        }
-    }
-}
-
 /// A unique source frame handed to an interpolator or enhancer.
 #[derive(Debug, Clone, Copy)]
 pub struct FrameInput<'a> {
@@ -289,36 +217,6 @@ struct PooledFrame {
     tex: Texture,
 }
 
-/// Counters for the overlay.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct RenderStats {
-    pub captured: u64,
-    pub unique: u64,
-    pub presented: u64,
-    pub interpolated: u64,
-    pub content_fps: f64,
-    pub mode: Option<VideoMode>,
-    pub color: Option<cp_core::ColorDesc>,
-    /// Capture arrival → present call, last frame (ms).
-    pub latency_ms: f64,
-    /// GPU time to produce one interpolated frame (ms, smoothed), including
-    /// optical-flow / CUDA work the queue waited for.
-    pub interp_gpu_ms: f64,
-    /// GPU time of the enhancement stage per unique frame (ms, smoothed).
-    pub enhance_gpu_ms: f64,
-    /// Active upscaling `(source, target)` size.
-    pub upscale: Option<((u32, u32), (u32, u32))>,
-    /// Time of the last upscale (ms).
-    pub upscale_ms: f64,
-    pub multiplier: u32,
-    /// Spread of actual vs. scheduled display times (ms, p95).
-    pub present_jitter_ms: Option<f64>,
-    /// Detected display behaviour.
-    pub refresh_kind: RefreshKind,
-    /// The schedule assumes a variable-refresh display.
-    pub vrr_timing: bool,
-}
-
 pub struct Renderer {
     // Field order = drop order: GPU users first, the device last.
     frames: Vec<FrameCtx>,
@@ -345,7 +243,7 @@ pub struct Renderer {
     /// Next enhanced frame must reset temporal history.
     enhance_reset: bool,
     shown: Option<Slot>,
-    upload: Arc<UploadRing>,
+    upload: Arc<UploadRing<D3d12UploadMemory>>,
     presenter: Presenter,
     ring: GpuDescriptorRing,
     heap: Rc<StagingHeap>,
@@ -438,7 +336,11 @@ impl Renderer {
         };
         let upload = {
             let w = wake.clone();
-            UploadRing::new(gpu.device.clone(), gpu.fence.clone(), move || w())
+            let memory = D3d12UploadMemory {
+                device: gpu.device.clone(),
+                fence: gpu.fence.clone(),
+            };
+            UploadRing::new(memory, move || w())
         };
         Ok(Self {
             timer: crate::gpu_timer::GpuTimer::new(&gpu, FRAMES_IN_FLIGHT)?,
@@ -486,7 +388,7 @@ impl Renderer {
         &self.gpu
     }
 
-    pub fn upload_ring(&self) -> Arc<UploadRing> {
+    pub fn upload_ring(&self) -> Arc<UploadRing<D3d12UploadMemory>> {
         self.upload.clone()
     }
 
@@ -498,7 +400,7 @@ impl Renderer {
         &self.presenter
     }
 
-    pub fn display(&self) -> &crate::display::DisplayInfo {
+    pub fn display(&self) -> &crate::display_info::DisplayInfo {
         self.presenter.display.info()
     }
 
@@ -1304,15 +1206,6 @@ impl Drop for Renderer {
         unsafe {
             let _ = windows::Win32::Foundation::CloseHandle(self.ingest_event);
         }
-    }
-}
-
-/// How long before a fixed-refresh vblank to present (variable refresh:
-/// exactly on time).
-fn slack_ns(refresh: Refresh) -> i64 {
-    match refresh {
-        Refresh::Variable { .. } => 0,
-        Refresh::Fixed { period_ns, .. } => (period_ns / 4).min(1_000_000),
     }
 }
 

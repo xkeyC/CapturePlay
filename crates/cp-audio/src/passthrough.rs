@@ -6,7 +6,7 @@
 //! only resampling we do is the ±0.5 % drift correction.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 
 use rtrb::{Consumer, Producer, RingBuffer};
@@ -24,32 +24,9 @@ use windows::Win32::System::Threading::{
 };
 use windows::core::w;
 
+pub use crate::config::{AudioConfig, AudioShared};
 use crate::drift::{DriftController, RatePuller};
 use crate::endpoints::open_device;
-
-#[derive(Debug, Clone)]
-pub struct AudioConfig {
-    /// Capture endpoint id.
-    pub input_id: String,
-    /// Render endpoint id; `None` = default console device.
-    pub output_id: Option<String>,
-    pub target_latency_ms: u32,
-    /// Extra audio delay to line up with the video pipeline (may be < 0 to
-    /// reduce the target, never below a safety floor).
-    pub av_offset_ms: i32,
-    pub volume: f32,
-}
-
-/// Live counters/controls shared with the UI.
-#[derive(Debug, Default)]
-pub struct AudioShared {
-    pub volume_milli: AtomicU32,
-    pub offset_ms: AtomicI32,
-    pub underruns: AtomicU64,
-    pub fill_ms: AtomicU32,
-    pub sample_rate: AtomicU32,
-    pub channels: AtomicU32,
-}
 
 #[derive(Debug, thiserror::Error)]
 pub enum AudioError {

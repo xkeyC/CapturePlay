@@ -8,6 +8,7 @@ use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::core::Result;
 
+use crate::common::{OutputParams, letterbox};
 use crate::descriptors::GpuDescriptorRing;
 use crate::gpu::{Gpu, shader_bytecode};
 use crate::presenter::BACKBUFFER_FORMAT;
@@ -27,28 +28,6 @@ struct Constants {
     out_scale: f32,
     catmull_rom: u32,
     pad: [f32; 3],
-}
-
-/// How the working frame maps onto the current display.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct OutputParams {
-    pub display_hdr: bool,
-    /// Display peak (nits), used when `display_hdr`.
-    pub display_peak_nits: f32,
-    /// SDR white (nits); the target white on SDR displays.
-    pub sdr_white_nits: f32,
-    /// Mastering peak of the content (nits).
-    pub content_peak_nits: f32,
-    pub catmull_rom: bool,
-}
-
-/// Aspect-preserving fit of `src` into `dst`: `(x, y, w, h)` in pixels.
-pub fn letterbox(src: (u32, u32), dst: (u32, u32)) -> (f32, f32, f32, f32) {
-    let (sw, sh) = (src.0.max(1) as f32, src.1.max(1) as f32);
-    let (dw, dh) = (dst.0.max(1) as f32, dst.1.max(1) as f32);
-    let s = (dw / sw).min(dh / sh);
-    let (w, h) = ((sw * s).round(), (sh * s).round());
-    (((dw - w) * 0.5).floor(), ((dh - h) * 0.5).floor(), w, h)
 }
 
 pub struct OutputPass {
@@ -166,26 +145,5 @@ impl OutputPass {
             list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
             list.DrawInstanced(3, 1, 0, 0);
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::letterbox;
-
-    #[test]
-    fn letterbox_fits_and_centers() {
-        assert_eq!(
-            letterbox((1920, 1080), (3840, 2160)),
-            (0.0, 0.0, 3840.0, 2160.0)
-        );
-        assert_eq!(
-            letterbox((1920, 1080), (3440, 1440)),
-            (440.0, 0.0, 2560.0, 1440.0)
-        );
-        assert_eq!(
-            letterbox((1920, 1080), (1920, 1200)),
-            (0.0, 60.0, 1920.0, 1080.0)
-        );
     }
 }

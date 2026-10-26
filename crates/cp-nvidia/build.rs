@@ -36,10 +36,11 @@ fn main() {
             println!("cargo:rustc-link-lib=dylib=advapi32");
             println!("cargo:rustc-cfg=ngx");
         }
-        None => {
+        None if target_ok => {
             println!(
                 "cargo:warning=RTX Video SDK not found: building without NGX VSR (see runtime/README.md)"
             );
         }
+        None => {}
     }
 }

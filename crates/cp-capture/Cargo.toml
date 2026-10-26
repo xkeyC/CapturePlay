@@ -1,6 +1,6 @@
 [package]
 name = "cp-capture"
-description = "Capture-card video input via Media Foundation."
+description = "Capture-card video input via Media Foundation (Windows) and V4L2 (Linux)."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,10 +9,15 @@ publish.workspace = true
 
 [dependencies]
 cp-core.workspace = true
-windows.workspace = true
-windows-core.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows.workspace = true
+windows-core.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc.workspace = true
 
 [lints]
 workspace = true
