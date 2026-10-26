@@ -12,9 +12,15 @@ thiserror.workspace = true
 tracing.workspace = true
 rtrb.workspace = true
 
+[target.'cfg(target_os = "linux")'.dependencies]
+pipewire.workspace = true
+
 [target.'cfg(windows)'.dependencies]
 windows.workspace = true
 windows-core.workspace = true
+
+[dev-dependencies]
+anyhow.workspace = true
 
 [lints]
 workspace = true

@@ -25,8 +25,8 @@ use windows::Win32::System::Threading::{
 use windows::core::w;
 
 pub use crate::config::{AudioConfig, AudioShared};
-use crate::drift::{DriftController, RatePuller};
 use crate::endpoints::open_device;
+use crate::playout::Playout;
 
 #[derive(Debug, thiserror::Error)]
 pub enum AudioError {
@@ -339,68 +339,25 @@ fn render_thread(
         let render: IAudioRenderClient = client.GetService()?;
         tracing::info!(rate, channels, buffer_frames, "audio render started");
 
-        let frames_per_ms = f64::from(rate) / 1000.0;
-        let target_for = |offset: i32| {
-            f64::from((cfg.target_latency_ms as i32 + offset).max(10)) * frames_per_ms
-        };
-        let mut ctl = DriftController::new(target_for(shared.offset_ms.load(Ordering::Relaxed)));
-        let mut puller = RatePuller::new(ch);
-        let mut waiting = true; // prefill to target before playing
+        let mut playout = Playout::new(
+            rate,
+            ch,
+            cfg.target_latency_ms,
+            shared.offset_ms.load(Ordering::Relaxed),
+        );
         let mut scratch = vec![0f32; buffer_frames as usize * ch];
         client.Start()?;
         while !stop.load(Ordering::Acquire) {
             if WaitForSingleObject(event.0, 100) != WAIT_OBJECT_0 {
                 continue;
             }
-            ctl.set_target(target_for(shared.offset_ms.load(Ordering::Relaxed)));
             let padding = client.GetCurrentPadding()?;
             let avail = (buffer_frames - padding) as usize;
             if avail == 0 {
                 continue;
             }
-            let fill = (consumer.slots() / ch) as f64;
-            shared
-                .fill_ms
-                .store((fill / frames_per_ms) as u32, Ordering::Relaxed);
-            let excess = ctl.excess(fill);
-            if excess > 0 {
-                if let Ok(c) = consumer.read_chunk(excess * ch) {
-                    c.commit_all();
-                }
-                ctl.reset();
-            }
-            if waiting && fill >= ctl.target() {
-                waiting = false;
-            }
             let out = &mut scratch[..avail * ch];
-            if waiting {
-                out.fill(0.0);
-            } else {
-                let ratio = ctl.ratio(fill);
-                let real = puller.fill(out, ratio, |frame| {
-                    if consumer.slots() < frame.len() {
-                        return false;
-                    }
-                    match consumer.read_chunk(frame.len()) {
-                        Ok(c) => {
-                            let (a, b) = c.as_slices();
-                            frame[..a.len()].copy_from_slice(a);
-                            frame[a.len()..].copy_from_slice(b);
-                            c.commit_all();
-                            true
-                        }
-                        Err(_) => false,
-                    }
-                });
-                if real < avail {
-                    shared.underruns.fetch_add(1, Ordering::Relaxed);
-                    waiting = true;
-                }
-                let vol = shared.volume_milli.load(Ordering::Relaxed) as f32 / 1000.0;
-                if (vol - 1.0).abs() > f32::EPSILON {
-                    out.iter_mut().for_each(|s| *s *= vol);
-                }
-            }
+            playout.fill(out, &mut consumer, shared);
             let dst = render.GetBuffer(avail as u32)?;
             std::ptr::copy_nonoverlapping(out.as_ptr(), dst.cast::<f32>(), out.len());
             render.ReleaseBuffer(avail as u32, 0)?;
