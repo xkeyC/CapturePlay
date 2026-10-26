@@ -31,6 +31,8 @@ pub const OUTPUT_PS: &[u8] = shader!("output_ps");
 pub const EGUI_VS: &[u8] = shader!("egui_vs");
 pub const EGUI_PS: &[u8] = shader!("egui_ps");
 pub const NGX_ENCODE: &[u8] = shader!("ngx_encode");
+pub const VFG_ENCODE: &[u8] = shader!("vfg_encode");
+pub const VFG_DECODE: &[u8] = shader!("vfg_decode");
 pub const NGX_DECODE: &[u8] = shader!("ngx_decode");
 
 pub const BINDING_SRV: u32 = 0;
@@ -178,6 +180,11 @@ impl Drop for Pipeline {
 
 impl Pipeline {
     pub fn compute(gpu: &Gpu, layouts: &Layouts, spv: &[u8]) -> Result<Self> {
+        Self::compute_in(gpu, layouts.compute, spv)
+    }
+
+    /// A compute pipeline with its own pipeline `layout`.
+    pub fn compute_in(gpu: &Gpu, layout: vk::PipelineLayout, spv: &[u8]) -> Result<Self> {
         let d = &gpu.device;
         let m = module(d, spv)?;
         let stage = vk::PipelineShaderStageCreateInfo::default()
@@ -186,7 +193,7 @@ impl Pipeline {
             .name(ENTRY_MAIN);
         let info = vk::ComputePipelineCreateInfo::default()
             .stage(stage)
-            .layout(layouts.compute);
+            .layout(layout);
         // SAFETY: valid module and layout; the module is destroyed after
         // pipeline creation (allowed).
         let r = unsafe { d.create_compute_pipelines(vk::PipelineCache::null(), &[info], None) };
@@ -280,6 +287,85 @@ impl Pipeline {
             pipeline,
         })
     }
+}
+
+/// A push-descriptor compute layout with custom binding types (shaders that
+/// read or write raw buffers).
+pub struct ComputeLayout {
+    device: ash::Device,
+    pub set: vk::DescriptorSetLayout,
+    pub layout: vk::PipelineLayout,
+}
+
+impl std::fmt::Debug for ComputeLayout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ComputeLayout")
+    }
+}
+
+impl ComputeLayout {
+    /// `bindings`: (binding, type) pairs; the constant buffer at
+    /// [`BINDING_CONSTANTS`] is added.
+    pub fn new(gpu: &Gpu, bindings: &[(u32, vk::DescriptorType)]) -> Result<Self> {
+        let d = &gpu.device;
+        let all: Vec<_> = bindings
+            .iter()
+            .copied()
+            .chain(std::iter::once((
+                BINDING_CONSTANTS,
+                vk::DescriptorType::UNIFORM_BUFFER,
+            )))
+            .map(|(b, ty)| {
+                vk::DescriptorSetLayoutBinding::default()
+                    .binding(b)
+                    .descriptor_type(ty)
+                    .descriptor_count(1)
+                    .stage_flags(vk::ShaderStageFlags::COMPUTE)
+            })
+            .collect();
+        // SAFETY: plain object creation; the set layout is destroyed if the
+        // pipeline layout fails.
+        unsafe {
+            let set = d.create_descriptor_set_layout(
+                &vk::DescriptorSetLayoutCreateInfo::default()
+                    .flags(vk::DescriptorSetLayoutCreateFlags::PUSH_DESCRIPTOR_KHR)
+                    .bindings(&all),
+                None,
+            )?;
+            match d.create_pipeline_layout(
+                &vk::PipelineLayoutCreateInfo::default().set_layouts(&[set]),
+                None,
+            ) {
+                Ok(layout) => Ok(Self {
+                    device: d.clone(),
+                    set,
+                    layout,
+                }),
+                Err(e) => {
+                    d.destroy_descriptor_set_layout(set, None);
+                    Err(e.into())
+                }
+            }
+        }
+    }
+}
+
+impl Drop for ComputeLayout {
+    fn drop(&mut self) {
+        // SAFETY: pipelines using the layout are destroyed first.
+        unsafe {
+            self.device.destroy_pipeline_layout(self.layout, None);
+            self.device.destroy_descriptor_set_layout(self.set, None);
+        }
+    }
+}
+
+/// Write of one storage buffer at `binding`.
+pub fn buffer_write(binding: u32, info: &[vk::DescriptorBufferInfo]) -> vk::WriteDescriptorSet<'_> {
+    vk::WriteDescriptorSet::default()
+        .dst_binding(binding)
+        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+        .buffer_info(info)
 }
 
 /// Opaque color writes (no blending).

@@ -5,11 +5,11 @@ use ash::vk;
 use cp_core::color::{decode_to_scrgb, yuv_to_rgb_matrix};
 use cp_core::{ColorDesc, PixelFormat, Rational, VideoMode};
 
-use super::arena::Arena;
 use super::convert::ConvertPass;
 use super::device::Gpu;
 use super::output::OutputPass;
 use super::pipeline::Layouts;
+use super::recording::Recording;
 use super::texture::{Buffer, Texture, WORKING_USAGE, barrier};
 use crate::common::{DecodeParams, OutputParams};
 use crate::half::{f16_to_f32, f32_to_f16};
@@ -17,9 +17,7 @@ use crate::upload::SlotLayout;
 
 struct Harness {
     layouts: Layouts,
-    arena: Arena,
-    pool: vk::CommandPool,
-    cmd: vk::CommandBuffer,
+    rec: Recording,
     keep: Vec<Buffer>,
     gpu: Gpu,
 }
@@ -36,32 +34,10 @@ impl Harness {
             }
         };
         let layouts = Layouts::new(&gpu).expect("layouts");
-        let arena = Arena::new(&gpu.device, &gpu.memory_properties, 4 << 20).expect("arena");
-        // SAFETY: plain object creation on a valid device.
-        let (pool, cmd) = unsafe {
-            let pool = gpu
-                .device
-                .create_command_pool(
-                    &vk::CommandPoolCreateInfo::default().queue_family_index(gpu.queue_family),
-                    None,
-                )
-                .expect("pool");
-            let cmd = gpu
-                .device
-                .allocate_command_buffers(
-                    &vk::CommandBufferAllocateInfo::default()
-                        .command_pool(pool)
-                        .level(vk::CommandBufferLevel::PRIMARY)
-                        .command_buffer_count(1),
-                )
-                .expect("cmd")[0];
-            (pool, cmd)
-        };
+        let rec = Recording::new(&gpu, 4 << 20).expect("recording");
         let mut h = Self {
             layouts,
-            arena,
-            pool,
-            cmd,
+            rec,
             keep: Vec::new(),
             gpu,
         };
@@ -70,24 +46,15 @@ impl Harness {
     }
 
     fn begin(&mut self) {
-        self.arena.reset();
-        // SAFETY: the previous submission completed (submit_wait).
-        unsafe {
-            self.gpu
-                .device
-                .reset_command_pool(self.pool, vk::CommandPoolResetFlags::empty())
-                .expect("reset");
-            self.gpu
-                .device
-                .begin_command_buffer(self.cmd, &vk::CommandBufferBeginInfo::default())
-                .expect("begin");
-        }
+        self.rec.begin(&self.gpu).expect("begin");
+    }
+
+    fn cmd(&self) -> vk::CommandBuffer {
+        self.rec.cmd()
     }
 
     fn submit_wait(&mut self) {
-        // SAFETY: the buffer is open and recorded.
-        unsafe { self.gpu.device.end_command_buffer(self.cmd).expect("end") };
-        let v = self.gpu.submit(self.cmd, &[], &[]).expect("submit");
+        let v = self.rec.submit(&self.gpu, &[], &[]).expect("submit");
         self.gpu.wait(v).expect("wait");
         self.keep.clear();
         self.begin();
@@ -122,7 +89,7 @@ impl Harness {
     fn upload(&mut self, w: u32, h: u32, rgba: &[[f32; 4]]) -> Texture {
         let tex = Texture::new(
             &self.gpu,
-            self.cmd,
+            self.cmd(),
             w,
             h,
             vk::Format::R16G16B16A16_SFLOAT,
@@ -133,18 +100,18 @@ impl Harness {
         let halves: Vec<u16> = rgba.iter().flatten().map(|&v| f32_to_f16(v)).collect();
         // SAFETY: the buffer holds exactly `halves`.
         unsafe { std::ptr::copy_nonoverlapping(halves.as_ptr().cast(), buf.ptr, halves.len() * 2) };
-        barrier(&self.gpu.device, self.cmd);
+        barrier(&self.gpu.device, self.cmd());
         // SAFETY: recording a copy within both resources.
         unsafe {
             self.gpu.device.cmd_copy_buffer_to_image(
-                self.cmd,
+                self.cmd(),
                 buf.buffer,
                 tex.image,
                 vk::ImageLayout::GENERAL,
                 &[Self::copy_region(w, h)],
             );
         }
-        barrier(&self.gpu.device, self.cmd);
+        barrier(&self.gpu.device, self.cmd());
         self.keep.push(buf);
         tex
     }
@@ -153,18 +120,18 @@ impl Harness {
     fn readback(&mut self, tex: &Texture) -> Vec<[f32; 4]> {
         let n = (tex.width * tex.height) as usize;
         let buf = self.host_buffer(n * 8, vk::BufferUsageFlags::TRANSFER_DST);
-        barrier(&self.gpu.device, self.cmd);
+        barrier(&self.gpu.device, self.cmd());
         // SAFETY: recording a copy within both resources.
         unsafe {
             self.gpu.device.cmd_copy_image_to_buffer(
-                self.cmd,
+                self.cmd(),
                 tex.image,
                 vk::ImageLayout::GENERAL,
                 buf.buffer,
                 &[Self::copy_region(tex.width, tex.height)],
             );
         }
-        barrier(&self.gpu.device, self.cmd);
+        barrier(&self.gpu.device, self.cmd());
         self.submit_wait();
         // SAFETY: the GPU finished writing; the mapping is coherent.
         let halves = unsafe { std::slice::from_raw_parts(buf.ptr.cast::<u16>(), n * 4) };
@@ -178,8 +145,6 @@ impl Harness {
 impl Drop for Harness {
     fn drop(&mut self) {
         let _ = self.gpu.wait_idle();
-        // SAFETY: the GPU is idle.
-        unsafe { self.gpu.device.destroy_command_pool(self.pool, None) };
     }
 }
 
@@ -285,7 +250,7 @@ fn check_420(format: PixelFormat, color: ColorDesc) {
     );
     let out = Texture::new(
         &h.gpu,
-        h.cmd,
+        h.cmd(),
         w,
         ht,
         vk::Format::R16G16B16A16_SFLOAT,
@@ -298,12 +263,13 @@ fn check_420(format: PixelFormat, color: ColorDesc) {
     };
     let mut convert = ConvertPass::new(&h.gpu, &h.layouts).expect("convert");
     let mut retire = Vec::new();
+    let cmd = h.cmd();
     convert
         .record(
             &h.gpu,
             &h.layouts,
-            &mut h.arena,
-            h.cmd,
+            &mut h.rec.arena,
+            cmd,
             &upload,
             &layout,
             &mode,
@@ -374,7 +340,7 @@ fn output_pass_is_upright_and_identity() {
     let tex = h.upload(w, ht, &src);
     let target = Texture::new(
         &h.gpu,
-        h.cmd,
+        h.cmd(),
         w,
         ht,
         vk::Format::R16G16B16A16_SFLOAT,
@@ -398,9 +364,9 @@ fn output_pass_is_upright_and_identity() {
         })
         .layer_count(1)
         .color_attachments(&attachments);
-    barrier(&h.gpu.device, h.cmd);
+    barrier(&h.gpu.device, h.cmd());
     // SAFETY: recording dynamic rendering into the offscreen target.
-    unsafe { h.gpu.device.cmd_begin_rendering(h.cmd, &rendering) };
+    unsafe { h.gpu.device.cmd_begin_rendering(h.cmd(), &rendering) };
     let params = OutputParams {
         display_hdr: true,
         display_peak_nits: 10_000.0,
@@ -408,18 +374,19 @@ fn output_pass_is_upright_and_identity() {
         content_peak_nits: 1000.0,
         catmull_rom: false,
     };
+    let cmd = h.cmd();
     pass.record(
         &h.gpu,
         &h.layouts,
-        &mut h.arena,
-        h.cmd,
+        &mut h.rec.arena,
+        cmd,
         Some(&tex),
         (w, ht),
         &params,
     )
     .expect("record");
     // SAFETY: closes the rendering begun above.
-    unsafe { h.gpu.device.cmd_end_rendering(h.cmd) };
+    unsafe { h.gpu.device.cmd_end_rendering(h.cmd()) };
     let got = h.readback(&target);
     for (i, (g, s)) in got.iter().zip(&src).enumerate() {
         for k in 0..3 {
@@ -450,7 +417,7 @@ fn output_pass_letterbox_and_tone_map() {
     let tex = h.upload(w, sh, &src);
     let target = Texture::new(
         &h.gpu,
-        h.cmd,
+        h.cmd(),
         w,
         th,
         vk::Format::R16G16B16A16_SFLOAT,
@@ -479,9 +446,9 @@ fn output_pass_letterbox_and_tone_map() {
         })
         .layer_count(1)
         .color_attachments(&attachments);
-    barrier(&h.gpu.device, h.cmd);
+    barrier(&h.gpu.device, h.cmd());
     // SAFETY: recording dynamic rendering into the offscreen target.
-    unsafe { h.gpu.device.cmd_begin_rendering(h.cmd, &rendering) };
+    unsafe { h.gpu.device.cmd_begin_rendering(h.cmd(), &rendering) };
     let (src_peak, dst_peak) = (1000.0, 400.0);
     let params = OutputParams {
         display_hdr: true,
@@ -490,18 +457,19 @@ fn output_pass_letterbox_and_tone_map() {
         content_peak_nits: src_peak,
         catmull_rom: false,
     };
+    let cmd = h.cmd();
     pass.record(
         &h.gpu,
         &h.layouts,
-        &mut h.arena,
-        h.cmd,
+        &mut h.rec.arena,
+        cmd,
         Some(&tex),
         (w, th),
         &params,
     )
     .expect("record");
     // SAFETY: closes the rendering begun above.
-    unsafe { h.gpu.device.cmd_end_rendering(h.cmd) };
+    unsafe { h.gpu.device.cmd_end_rendering(h.cmd()) };
     let got = h.readback(&target);
     for y in 0..th {
         for x in 0..w {
@@ -582,20 +550,17 @@ fn vsr_ngx_upscales_a_smooth_pattern() {
     let tex = h.upload(sw, sh, &src);
     let out = Texture::new(
         &h.gpu,
-        h.cmd,
+        h.cmd(),
         dw,
         dh,
         vk::Format::R16G16B16A16_SFLOAT,
         WORKING_USAGE,
     )
     .expect("out");
-    let mut retire = Vec::new();
     let mut ctx = RecordCtx {
         gpu: &h.gpu,
         layouts: &h.layouts,
-        arena: &mut h.arena,
-        cmd: h.cmd,
-        retire: &mut retire,
+        rec: &mut h.rec,
     };
     up.upscale(&mut ctx, &tex, &out).expect("upscale");
     let got = h.readback(&out);
@@ -612,4 +577,100 @@ fn vsr_ngx_upscales_a_smooth_pattern() {
     let mean = err / f64::from((dw - 16) * (dh - 16) * 3);
     eprintln!("VSR mean abs error {mean:.4} (scRGB units)");
     assert!(mean < 0.02, "VSR output does not match the pattern: {mean}");
+}
+
+/// VFG through CUDA ↔ Vulkan interop, end to end (exported memory and
+/// timeline semaphores, `submit_and_continue` / `wait_next`): identical
+/// frames must come back unchanged, two flat colors must give a color
+/// between them. Needs the NVIDIA Video Effects runtime:
+/// `CAPTUREPLAY_VFX_RUNTIME=<dir> cargo test -p cp-render vfg -- --ignored`.
+#[test]
+#[ignore = "needs the NVIDIA Video Effects runtime (CAPTUREPLAY_VFX_RUNTIME)"]
+fn vfg_interpolates_through_cuda_interop() {
+    use super::Interpolator;
+    use super::interp_vfg::VfgInterpolator;
+    use super::renderer::{FrameInput, RecordCtx};
+
+    let Some(mut h) = Harness::new() else { return };
+    let root = std::path::PathBuf::from(
+        std::env::var_os("CAPTUREPLAY_VFX_RUNTIME").expect("CAPTUREPLAY_VFX_RUNTIME"),
+    );
+    let dir = [root.join("nvvfx").join("libs"), root]
+        .into_iter()
+        .find(|d| cp_nvidia::vfg::runtime_present(d))
+        .expect("VFG runtime");
+    let mut vfg = VfgInterpolator::new(&h.gpu, dir, 1).expect("VFG");
+    // Inputs span 0..1 scRGB: use that as SDR white.
+    vfg.set_content(false, 1.0);
+    let (w, ht) = (640u32, 360u32);
+    let image = |f: &dyn Fn(f32, f32) -> [f32; 3]| -> Vec<[f32; 4]> {
+        (0..ht)
+            .flat_map(|y| {
+                (0..w).map(move |x| {
+                    let p = f((x as f32 + 0.5) / w as f32, (y as f32 + 0.5) / ht as f32);
+                    [p[0], p[1], p[2], 1.0]
+                })
+            })
+            .collect()
+    };
+    let out = Texture::new(
+        &h.gpu,
+        h.cmd(),
+        w,
+        ht,
+        vk::Format::R16G16B16A16_SFLOAT,
+        WORKING_USAGE,
+    )
+    .expect("out");
+
+    let mut run = |h: &mut Harness, a: &[[f32; 4]], b: &[[f32; 4]], ids: (u64, u64)| {
+        let ta = h.upload(w, ht, a);
+        let tb = h.upload(w, ht, b);
+        let mut ctx = RecordCtx {
+            gpu: &h.gpu,
+            layouts: &h.layouts,
+            rec: &mut h.rec,
+        };
+        vfg.interpolate(
+            &mut ctx,
+            FrameInput {
+                id: ids.0,
+                tex: &ta,
+            },
+            FrameInput {
+                id: ids.1,
+                tex: &tb,
+            },
+            0.5,
+            &out,
+        )
+        .expect("interpolate");
+        h.readback(&out)
+    };
+
+    let pattern = |u: f32, v: f32| [0.2 + 0.6 * u, 0.2 + 0.5 * v, 0.7 - 0.4 * u];
+    let still = image(&pattern);
+    let got = run(&mut h, &still, &still, (1, 2));
+    let mean = got
+        .iter()
+        .zip(&still)
+        .map(|(g, s)| (0..3).map(|k| f64::from((g[k] - s[k]).abs())).sum::<f64>())
+        .sum::<f64>()
+        / (got.len() * 3) as f64;
+    eprintln!("VFG identical frames: mean abs error {mean:.4}");
+    assert!(mean < 0.02, "identical frames changed: {mean}");
+
+    let a = image(&|_, _| [0.1, 0.3, 0.8]);
+    let b = image(&|_, _| [0.7, 0.3, 0.1]);
+    let got = run(&mut h, &a, &b, (3, 4));
+    let mid = got[(ht / 2 * w + w / 2) as usize];
+    eprintln!("VFG flat colors: centre {:?}", &mid[..3]);
+    for k in 0..3 {
+        let (lo, hi) = (a[0][k].min(b[0][k]) - 0.02, a[0][k].max(b[0][k]) + 0.02);
+        assert!(
+            (lo..=hi).contains(&mid[k]),
+            "channel {k} {} outside {lo}..{hi}",
+            mid[k]
+        );
+    }
 }

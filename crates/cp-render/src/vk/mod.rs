@@ -24,10 +24,12 @@ pub mod convert;
 pub mod device;
 pub mod display;
 pub mod egui_pass;
+pub mod interp_vfg;
 pub mod output;
 pub mod pipeline;
 pub mod present_timing_ext;
 pub mod presenter;
+pub mod recording;
 pub mod renderer;
 #[cfg(test)]
 mod tests;
@@ -36,6 +38,7 @@ pub mod timer;
 pub mod upload;
 pub mod upscale_ngx;
 
+pub use interp_vfg::VfgInterpolator;
 pub use renderer::{FrameInput, Interpolator, RecordCtx, Renderer, Upscaler};
 pub use upscale_ngx::NgxVsrUpscaler;
 

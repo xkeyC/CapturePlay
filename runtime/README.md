@@ -65,3 +65,20 @@ any parent directory of it (so `target/release` builds find this folder).
 
 The CUDA driver (`nvcuda.dll`) ships with the display driver and needs
 nothing here.
+
+## Linux
+
+| Folder | Contents | Used by |
+|---|---|---|
+| `nvidia-vfx/` | The `nvidia-vfx` wheel for Linux (`nvidia_vfx-*-manylinux_*.whl` on pypi.nvidia.com), unzipped as-is (`nvvfx/libs/` + `nvidia_vfx.libs/`), or just the contents of `nvvfx/libs` plus `libcudart-*.so*` | AI frame interpolation (`libnvVFXVideoFrameGeneration.so`, CUDA ↔ Vulkan) and RTX VSR (`libnvidia-ngx-vsr.so`, NGX on Vulkan) |
+| `ngx-sdk/` | `lib/Linux_x86_64/libnvsdk_ngx.a` from NVIDIA's DLSS SDK (github.com/NVIDIA/DLSS) | Build time: the static NGX loader for VSR. The flake dev shell provides it as `$CAPTUREPLAY_NGX_SDK` |
+
+Lookup order of the runtime: `interpolation.vfx_runtime_dir` in
+`settings.toml` → `CAPTUREPLAY_VFX_RUNTIME` → `runtime/nvidia-vfx` next to
+the executable or in any parent; each may be the wheel root or the
+libraries folder. The CUDA driver (`libcuda.so.1`) and NGX core
+(`libnvidia-ngx.so`) come with the NVIDIA driver (`/run/opengl-driver/lib`
+on NixOS, which the dev shell adds to `LD_LIBRARY_PATH`).
+
+The GPU tests that need the runtime run on request:
+`CAPTUREPLAY_VFX_RUNTIME=<dir> cargo test -p cp-render -- --ignored`.

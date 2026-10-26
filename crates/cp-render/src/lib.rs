@@ -70,4 +70,6 @@ pub use texture::Texture;
 #[cfg(windows)]
 pub use upscale_ngx::NgxVsrUpscaler;
 #[cfg(target_os = "linux")]
-pub use vk::{FrameInput, Interpolator, NgxVsrUpscaler, RecordCtx, Renderer, Upscaler};
+pub use vk::{
+    FrameInput, Interpolator, NgxVsrUpscaler, RecordCtx, Renderer, Upscaler, VfgInterpolator,
+};

@@ -1,19 +1,49 @@
 //! NVIDIA Video Effects SDK "VideoFrameGeneration": AI frame interpolation
-//! (RTX 40/50), bridged to D3D12 without CPU copies or CPU waits (see
-//! [`crate::vfx`]).
+//! (RTX 40/50), bridged to D3D12 (Windows) or Vulkan (Linux) without CPU
+//! copies or CPU waits (see [`crate::vfx`]).
 
 use std::path::Path;
 
+#[cfg(windows)]
 use windows::Win32::Foundation::LUID;
+#[cfg(windows)]
 use windows::Win32::Graphics::Direct3D12::{ID3D12Device, ID3D12Fence, ID3D12Resource};
 
 use crate::vfx::{self, Bridge, Effect, SharedImage, VfxError};
 
+#[cfg(windows)]
 pub const EFFECT_DLL: &str = "nvVFXVideoFrameGeneration.dll";
+#[cfg(not(windows))]
+pub const EFFECT_DLL: &str = "libnvVFXVideoFrameGeneration.so";
 
 /// Whether the VFG runtime is present in `dir`.
 pub fn runtime_present(dir: &Path) -> bool {
     vfx::runtime_present(dir, &[EFFECT_DLL])
+}
+
+/// A Vulkan buffer exported for CUDA (dedicated allocation).
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+pub struct ExportedBuffer {
+    pub fd: std::os::fd::OwnedFd,
+    /// Allocation size in bytes.
+    pub size: u64,
+}
+
+/// Exported Vulkan objects a session imports (Linux).
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+pub struct VulkanShared {
+    /// `VkPhysicalDeviceIDProperties::deviceUUID`.
+    pub device_uuid: [u8; 16],
+    /// Packed RGB10A2 input slots and the output, rows of `pitch` bytes.
+    pub inputs: [ExportedBuffer; 2],
+    pub output: ExportedBuffer,
+    pub pitch: u32,
+    /// Timeline semaphore Vulkan signals when inputs are ready.
+    pub producer: std::os::fd::OwnedFd,
+    /// Timeline semaphore CUDA signals when the output is written.
+    pub completion: std::os::fd::OwnedFd,
 }
 
 /// One VFG effect instance with two input slots and one output.
@@ -21,6 +51,8 @@ pub struct VfgSession {
     // Drop order: effect, images, then the bridge (stream, context).
     effect: Effect,
     inputs: [SharedImage; 2],
+    /// Bound as `DstImage0`; on Linux only kept alive here.
+    #[cfg_attr(not(windows), allow(dead_code))]
     output: SharedImage,
     /// Inputs currently bound as (previous, current) slots.
     bound: Option<(usize, usize)>,
@@ -38,6 +70,7 @@ impl std::fmt::Debug for VfgSession {
 
 impl VfgSession {
     /// Creates the session. `mode`: 0 low, 1 medium, 2 high quality.
+    #[cfg(windows)]
     pub fn new(
         device: &ID3D12Device,
         luid: LUID,
@@ -80,21 +113,80 @@ impl VfgSession {
         })
     }
 
+    /// Imports the Vulkan buffers and semaphores of `shared` and loads the
+    /// effect for `width × height`.
+    #[cfg(target_os = "linux")]
+    pub fn new(
+        shared: VulkanShared,
+        runtime_dir: &Path,
+        width: u32,
+        height: u32,
+        mode: u32,
+    ) -> Result<Self, VfxError> {
+        let VulkanShared {
+            device_uuid,
+            inputs: [in0, in1],
+            output,
+            pitch,
+            producer,
+            completion,
+        } = shared;
+        let bridge = Bridge::new(
+            device_uuid,
+            runtime_dir,
+            EFFECT_DLL,
+            (8, 9),
+            producer,
+            completion,
+        )?;
+        let import = |b: ExportedBuffer| bridge.import_image(b.fd, b.size, width, height, pitch);
+        let inputs = [import(in0)?, import(in1)?];
+        let output = import(output)?;
+        let effect = bridge.effect("VideoFrameGeneration")?;
+        {
+            let _g = bridge.push()?;
+            effect.set_u32("InputWidth", width)?;
+            effect.set_u32("InputHeight", height)?;
+            effect.set_u32("Mode", mode.min(2))?;
+            // See the Windows constructor.
+            effect.set_u32("AutomaticShotChangeDetectionEnabled", 0)?;
+            effect.set_image("SrcImage0", &inputs[0])?;
+            effect.set_image("SrcImage1", &inputs[1])?;
+            effect.set_image("DstImage0", &output)?;
+            effect.load()?;
+        }
+        tracing::info!(width, height, mode, "NVIDIA VFG session ready");
+        Ok(Self {
+            effect,
+            pitch,
+            inputs,
+            output,
+            bound: None,
+            width,
+            height,
+            bridge,
+        })
+    }
+
     /// D3D12 buffer of input slot `i` (packed RGB10A2 rows of `pitch` bytes).
+    #[cfg(windows)]
     pub fn input(&self, i: usize) -> &ID3D12Resource {
         self.inputs[i].resource()
     }
 
+    #[cfg(windows)]
     pub fn output(&self) -> &ID3D12Resource {
         self.output.resource()
     }
 
     /// Fence the D3D12 queue signals when inputs are ready.
+    #[cfg(windows)]
     pub fn producer(&self) -> &ID3D12Fence {
         self.bridge.producer()
     }
 
     /// Fence CUDA signals when the output is written.
+    #[cfg(windows)]
     pub fn completion(&self) -> &ID3D12Fence {
         self.bridge.completion()
     }

@@ -104,7 +104,7 @@ cargo build --release
 ./target/release/capture-play
 ~~~
 
-Status: capture, color conversion, HDR output (scRGB, mapped through the compositor's reference luminance) and the UI work; interpolation (VFG), upscaling (VSR), audio passthrough and present-timing feedback are not ported yet, NR is not supported. Settings live in `$XDG_CONFIG_HOME/CapturePlay/` (default `~/.config/CapturePlay/`); `CAPTUREPLAY_VK_DEBUG=1` enables the Vulkan validation layer.
+Status: capture, color conversion, HDR output (scRGB, mapped through the compositor's reference luminance), the UI, present-timing feedback (`VK_EXT_present_timing`) and PipeWire audio passthrough work; interpolation (VFG, CUDA ↔ Vulkan interop) and upscaling (VSR, NGX on Vulkan) are implemented, need the NVIDIA Video Effects runtime (see `runtime/README.md`) and await validation on real hardware; NR is not supported. Settings live in `$XDG_CONFIG_HOME/CapturePlay/` (default `~/.config/CapturePlay/`); `CAPTUREPLAY_VK_DEBUG=1` enables the Vulkan validation layer, `CAPTUREPLAY_VK_TIMED_PRESENT=1` tries presenting at target times (experimental).
 
 ### 1.7 Notes
 
