@@ -18,7 +18,6 @@ use cp_core::settings::RefreshMode;
 use cp_core::time::HostTime;
 use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
 
-use super::arena::Arena;
 use super::clock::{Event, PreciseSleep};
 use super::convert::ConvertPass;
 use super::device::Gpu;
@@ -27,6 +26,7 @@ use super::egui_pass::EguiPass;
 use super::output::OutputPass;
 use super::pipeline::Layouts;
 use super::presenter::{OutputEncoding, Presenter};
+use super::recording::Recording;
 use super::texture::{Texture, WORKING_USAGE, layout_barrier};
 use super::timer::GpuTimer;
 use super::upload::VkUploadMemory;
@@ -90,16 +90,32 @@ pub struct FrameInput<'a> {
     pub tex: &'a Texture,
 }
 
-/// Per-frame recording context handed to backends.
+/// Per-frame recording context handed to backends: the open command
+/// buffer, the frame arena and retire list (`rec`), and hand-over to other
+/// engines (see [`Recording`]).
 #[allow(missing_debug_implementations)]
 pub struct RecordCtx<'a> {
     pub gpu: &'a Gpu,
     pub layouts: &'a Layouts,
-    pub arena: &'a mut Arena,
-    pub cmd: vk::CommandBuffer,
-    /// Textures replaced while recording: destroyed once this frame's work
-    /// completed.
-    pub retire: &'a mut Vec<Texture>,
+    pub rec: &'a mut Recording,
+}
+
+impl RecordCtx<'_> {
+    /// The open command buffer (changes after [`Self::submit_and_continue`]).
+    pub fn cmd(&self) -> vk::CommandBuffer {
+        self.rec.cmd()
+    }
+
+    /// Submits what has been recorded so far, signaling `signal`, and
+    /// continues in a new command buffer.
+    pub fn submit_and_continue(&mut self, signal: &[(vk::Semaphore, u64)]) -> Result<u64> {
+        self.rec.submit_and_continue(self.gpu, signal)
+    }
+
+    /// Makes the rest of the frame wait for `semaphore >= value`.
+    pub fn wait_next(&mut self, semaphore: vk::Semaphore, value: u64) {
+        self.rec.wait_next(semaphore, value);
+    }
 }
 
 /// Inspection aid: stop on an interpolated frame.
@@ -111,28 +127,18 @@ enum Freeze {
 }
 
 struct FrameCtx {
+    rec: Recording,
     device: ash::Device,
-    pool: vk::CommandPool,
-    cmd: vk::CommandBuffer,
-    arena: Arena,
-    /// Timeline value of this context's last submission.
-    value: u64,
     /// Signaled by the swapchain acquire of this context's present.
     acquired: vk::Semaphore,
     /// egui textures to free once this frame completed.
     pending_free: Vec<egui::TextureId>,
-    /// Textures replaced while this frame was recorded; destroyed once it
-    /// completed (later than any earlier use: the timeline is monotonic).
-    retire: Vec<Texture>,
 }
 
 impl Drop for FrameCtx {
     fn drop(&mut self) {
         // SAFETY: the renderer waited for the GPU before dropping frames.
-        unsafe {
-            self.device.destroy_command_pool(self.pool, None);
-            self.device.destroy_semaphore(self.acquired, None);
-        }
+        unsafe { self.device.destroy_semaphore(self.acquired, None) };
     }
 }
 
@@ -232,33 +238,16 @@ impl Renderer {
         let frames = (0..FRAMES_IN_FLIGHT)
             .map(|_| {
                 // SAFETY: plain object creation on a valid device.
-                unsafe {
-                    let pool = gpu.device.create_command_pool(
-                        &vk::CommandPoolCreateInfo::default()
-                            .flags(vk::CommandPoolCreateFlags::TRANSIENT)
-                            .queue_family_index(gpu.queue_family),
-                        None,
-                    )?;
-                    let cmd = gpu.device.allocate_command_buffers(
-                        &vk::CommandBufferAllocateInfo::default()
-                            .command_pool(pool)
-                            .level(vk::CommandBufferLevel::PRIMARY)
-                            .command_buffer_count(1),
-                    )?[0];
-                    let acquired = gpu
-                        .device
-                        .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)?;
-                    Ok(FrameCtx {
-                        device: gpu.device.clone(),
-                        pool,
-                        cmd,
-                        arena: Arena::new(&gpu.device, &gpu.memory_properties, ARENA_BYTES)?,
-                        value: 0,
-                        acquired,
-                        pending_free: Vec::new(),
-                        retire: Vec::new(),
-                    })
-                }
+                let acquired = unsafe {
+                    gpu.device
+                        .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)?
+                };
+                Ok(FrameCtx {
+                    rec: Recording::new(&gpu, ARENA_BYTES)?,
+                    device: gpu.device.clone(),
+                    acquired,
+                    pending_free: Vec::new(),
+                })
             })
             .collect::<Result<Vec<_>>>()?;
         let ingest_event = Arc::new(Event::new().map_err(io)?);
@@ -409,7 +398,7 @@ impl Renderer {
     }
 
     fn cmd(&self) -> vk::CommandBuffer {
-        self.frames[self.frame_index].cmd
+        self.frames[self.frame_index].rec.cmd()
     }
 
     /// A working-format texture created on the current command buffer.
@@ -445,7 +434,7 @@ impl Renderer {
         {
             let t = self.working_texture(dst)?;
             let old = self.upscaled.replace(t);
-            self.frames[self.frame_index].retire.extend(old);
+            self.frames[self.frame_index].rec.retire.extend(old);
         }
         let Some(mut up) = self.upscaler.take() else {
             return Ok(false);
@@ -460,16 +449,15 @@ impl Renderer {
             return Ok(false);
         };
         let f = &mut self.frames[self.frame_index];
-        self.upscale_timer.begin(f.cmd, self.frame_index);
+        self.upscale_timer.begin(f.rec.cmd(), self.frame_index);
         let mut ctx = RecordCtx {
             gpu: &self.gpu,
             layouts: &self.layouts,
-            arena: &mut f.arena,
-            cmd: f.cmd,
-            retire: &mut f.retire,
+            rec: &mut f.rec,
         };
         let result = up.upscale(&mut ctx, src, out);
-        self.upscale_timer.end(f.cmd, self.frame_index);
+        self.upscale_timer
+            .end(self.frames[self.frame_index].rec.cmd(), self.frame_index);
         match result {
             Ok(()) => {
                 self.stats.upscale = Some((src_size, dst));
@@ -675,6 +663,7 @@ impl Renderer {
             .partition(|p| size_ok(&p.tex) || p.id.is_some_and(|id| retained.contains(&id)));
         self.pool = keep;
         self.frames[self.frame_index]
+            .rec
             .retire
             .extend(drop.into_iter().map(|p| p.tex));
         if let Some(i) = self
@@ -709,7 +698,7 @@ impl Renderer {
                     .map_or(0, |(i, _)| i);
                 let tex = self.working_texture(size)?;
                 let old = std::mem::replace(&mut self.pool[i], PooledFrame { id: None, tex });
-                self.frames[self.frame_index].retire.push(old.tex);
+                self.frames[self.frame_index].rec.retire.push(old.tex);
                 Ok(i)
             }
         }
@@ -726,9 +715,8 @@ impl Renderer {
     fn begin_frame(&mut self) -> Result<()> {
         self.frame_index = (self.frame_index + 1) % FRAMES_IN_FLIGHT;
         let i = self.frame_index;
-        self.gpu.wait(self.frames[i].value)?;
+        self.frames[i].rec.begin(&self.gpu)?;
         let f = &mut self.frames[i];
-        f.retire.clear();
         self.egui
             .free_textures(&std::mem::take(&mut f.pending_free));
         if let Some(ms) = self.upscale_timer.read(i) {
@@ -738,18 +726,6 @@ impl Renderer {
         if let Some(ms) = self.timer.read(i) {
             let s = &mut self.stats.interp_gpu_ms;
             *s = if *s == 0.0 { ms } else { *s * 0.9 + ms * 0.1 };
-        }
-        f.arena.reset();
-        // SAFETY: the GPU finished this pool's previous work (timeline wait).
-        unsafe {
-            self.gpu
-                .device
-                .reset_command_pool(f.pool, vk::CommandPoolResetFlags::empty())?;
-            self.gpu.device.begin_command_buffer(
-                f.cmd,
-                &vk::CommandBufferBeginInfo::default()
-                    .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
-            )?;
         }
         Ok(())
     }
@@ -842,19 +818,20 @@ impl Renderer {
             self.next_id += 1;
             self.pool[pi].id = Some(id);
             let params = self.decode_params();
-            let fr = &mut self.frames[self.frame_index];
+            let rec = &mut self.frames[self.frame_index].rec;
+            let cmd = rec.cmd();
             self.convert.record(
                 &self.gpu,
                 &self.layouts,
-                &mut fr.arena,
-                fr.cmd,
+                &mut rec.arena,
+                cmd,
                 &buffer,
                 &f.layout,
                 &f.meta.mode,
                 &f.meta.color,
                 params,
                 &self.pool[pi].tex,
-                &mut fr.retire,
+                &mut rec.retire,
             )?;
             converted_slots.push(f.slot);
             let frame = NewFrame {
@@ -867,7 +844,7 @@ impl Renderer {
             self.schedule_frame(&frame, refresh);
         }
         self.finish(None)?;
-        let value = self.frames[self.frame_index].value;
+        let value = self.frames[self.frame_index].rec.value;
         for s in converted_slots {
             self.upload.release(s, value);
         }
@@ -917,8 +894,9 @@ impl Renderer {
         // so they are never lost.
         if let Some(ui) = &ui {
             let f = &mut self.frames[self.frame_index];
+            let cmd = f.rec.cmd();
             self.egui
-                .upload(&self.gpu, &mut f.arena, f.cmd, ui, &mut f.retire)?;
+                .upload(&self.gpu, &mut f.rec.arena, cmd, ui, &mut f.rec.retire)?;
             f.pending_free
                 .extend(ui.textures_delta.free.iter().copied());
         }
@@ -979,7 +957,7 @@ impl Renderer {
         self.output.record(
             &self.gpu,
             &self.layouts,
-            &mut f.arena,
+            &mut f.rec.arena,
             cmd,
             src,
             size,
@@ -987,7 +965,7 @@ impl Renderer {
         )?;
         if let Some(ui) = &ui {
             self.egui
-                .draw(&self.gpu, &self.layouts, &mut f.arena, cmd, size, ui)?;
+                .draw(&self.gpu, &self.layouts, &mut f.rec.arena, cmd, size, ui)?;
         }
         // SAFETY: closes the rendering begun above.
         unsafe { self.gpu.device.cmd_end_rendering(cmd) };
@@ -1048,7 +1026,7 @@ impl Renderer {
         {
             let t = self.working_texture(size)?;
             let old = self.interp_out.replace(t);
-            self.frames[self.frame_index].retire.extend(old);
+            self.frames[self.frame_index].rec.retire.extend(old);
         }
         let Some(mut interp) = self.interpolator.take() else {
             return Ok(false);
@@ -1066,9 +1044,7 @@ impl Renderer {
         let mut ctx = RecordCtx {
             gpu: &self.gpu,
             layouts: &self.layouts,
-            arena: &mut f.arena,
-            cmd: f.cmd,
-            retire: &mut f.retire,
+            rec: &mut f.rec,
         };
         let r = interp.interpolate(
             &mut ctx,
@@ -1110,18 +1086,19 @@ impl Renderer {
     /// Ends and submits the frame's command buffer; with `present`, waits
     /// for the acquired image and signals its render-done semaphore.
     fn finish(&mut self, present: Option<(vk::Semaphore, vk::Semaphore)>) -> Result<()> {
-        let cmd = self.cmd();
-        // SAFETY: the buffer is open and fully recorded.
-        unsafe { self.gpu.device.end_command_buffer(cmd)? };
-        let value = match present {
-            Some((acquired, done)) => self.gpu.submit(
-                cmd,
-                &[(acquired, vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)],
-                &[done],
+        let rec = &mut self.frames[self.frame_index].rec;
+        match present {
+            Some((acquired, done)) => rec.submit(
+                &self.gpu,
+                &[(
+                    acquired,
+                    0,
+                    vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+                )],
+                &[(done, 0)],
             )?,
-            None => self.gpu.submit(cmd, &[], &[])?,
+            None => rec.submit(&self.gpu, &[], &[])?,
         };
-        self.frames[self.frame_index].value = value;
         Ok(())
     }
 }

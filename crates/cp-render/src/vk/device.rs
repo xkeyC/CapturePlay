@@ -27,6 +27,8 @@ pub struct Features {
     pub present_at_absolute_time: bool,
     /// Every extension NGX asked for is enabled (VSR on Vulkan).
     pub ngx: bool,
+    /// Memory and semaphores exportable as opaque fds (CUDA interop, VFG).
+    pub external_fd: bool,
 }
 
 /// The device and its queue. Owned by the render thread; the timeline
@@ -52,6 +54,10 @@ pub struct Gpu {
     pub surface_caps2_fn: Option<ash::khr::get_surface_capabilities2::Instance>,
     pub present_timing_fn: Option<PresentTimingFn>,
     pub calibrated_fn: Option<ash::khr::calibrated_timestamps::Device>,
+    pub external_memory_fn: Option<ash::khr::external_memory_fd::Device>,
+    pub external_semaphore_fn: Option<ash::khr::external_semaphore_fd::Device>,
+    /// `VkPhysicalDeviceIDProperties::deviceUUID` (matches the CUDA device).
+    pub device_uuid: [u8; 16],
     /// Signaled with increasing values by every submission.
     pub timeline: vk::Semaphore,
     next_value: Cell<u64>,
@@ -260,6 +266,22 @@ impl Gpu {
                 enable.push(pt::KHR_PRESENT_ID_2.as_ptr());
                 enable.push(pt::KHR_CALIBRATED_TIMESTAMPS.as_ptr());
             }
+            let external_fd = has_ext(&dev_exts, ash::khr::external_memory_fd::NAME)
+                && has_ext(&dev_exts, ash::khr::external_semaphore_fd::NAME);
+            if external_fd {
+                for name in [
+                    ash::khr::external_memory_fd::NAME,
+                    ash::khr::external_semaphore_fd::NAME,
+                ] {
+                    if !enable.iter().any(|&p| CStr::from_ptr(p) == name) {
+                        enable.push(name.as_ptr());
+                    }
+                }
+            }
+            let mut id_props = vk::PhysicalDeviceIDProperties::default();
+            let mut props2 = vk::PhysicalDeviceProperties2::default().push_next(&mut id_props);
+            instance.get_physical_device_properties2(physical, &mut props2);
+            let device_uuid = id_props.device_uuid;
 
             let priorities = [1.0f32];
             let queues = [vk::DeviceQueueCreateInfo::default()
@@ -302,6 +324,11 @@ impl Gpu {
 
             let gpu = Self {
                 memory_properties: instance.get_physical_device_memory_properties(physical),
+                external_memory_fn: external_fd
+                    .then(|| ash::khr::external_memory_fd::Device::new(&instance, &device)),
+                external_semaphore_fn: external_fd
+                    .then(|| ash::khr::external_semaphore_fd::Device::new(&instance, &device)),
+                device_uuid,
                 timestamp_period: props.limits.timestamp_period,
                 min_uniform_alignment: props.limits.min_uniform_buffer_offset_alignment,
                 swapchain_fn: ash::khr::swapchain::Device::new(&instance, &device),
@@ -321,6 +348,7 @@ impl Gpu {
                     present_timing,
                     present_at_absolute_time,
                     ngx: ngx_ok,
+                    external_fd,
                 },
                 vendor_id: props.vendor_id,
                 adapter_name,
@@ -435,31 +463,34 @@ impl Gpu {
         self.next_value.get()
     }
 
-    /// Submits `cmd`, waiting on `waits` (binary semaphores, at the given
-    /// stages) and signaling `signal` (binary) plus the timeline. Returns the
-    /// timeline value that marks completion.
+    /// Submits `cmd`, waiting on `waits` and signaling `signal` plus the
+    /// device timeline. Each semaphore comes with a timeline value (`0` for
+    /// a binary semaphore); waits also name the stages they block. Returns
+    /// the device timeline value that marks completion.
     pub fn submit(
         &self,
         cmd: vk::CommandBuffer,
-        waits: &[(vk::Semaphore, vk::PipelineStageFlags2)],
-        signal: &[vk::Semaphore],
+        waits: &[(vk::Semaphore, u64, vk::PipelineStageFlags2)],
+        signal: &[(vk::Semaphore, u64)],
     ) -> Result<u64> {
         let value = self.next_value.get();
         self.next_value.set(value + 1);
         let cmds = [vk::CommandBufferSubmitInfo::default().command_buffer(cmd)];
         let wait_infos: Vec<_> = waits
             .iter()
-            .map(|&(s, stage)| {
+            .map(|&(s, v, stage)| {
                 vk::SemaphoreSubmitInfo::default()
                     .semaphore(s)
+                    .value(v)
                     .stage_mask(stage)
             })
             .collect();
         let mut signal_infos: Vec<_> = signal
             .iter()
-            .map(|&s| {
+            .map(|&(s, v)| {
                 vk::SemaphoreSubmitInfo::default()
                     .semaphore(s)
+                    .value(v)
                     .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
             })
             .collect();

@@ -285,7 +285,7 @@ impl Upscaler for NgxVsrUpscaler {
         {
             let usage = vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::SAMPLED;
             let surface =
-                |(w, h): Size| Texture::new(ctx.gpu, ctx.cmd, w, h, SURFACE_FORMAT, usage);
+                |(w, h): Size| Texture::new(ctx.gpu, ctx.cmd(), w, h, SURFACE_FORMAT, usage);
             let new = Surfaces {
                 src: src_size,
                 dst: dst_size,
@@ -293,7 +293,7 @@ impl Upscaler for NgxVsrUpscaler {
                 output: surface(dst_size)?,
             };
             if let Some(old) = self.surfaces.replace(new) {
-                ctx.retire.extend([old.input, old.output]);
+                ctx.rec.retire.extend([old.input, old.output]);
             }
         }
         let Some(s) = self.surfaces.as_ref() else {
@@ -309,6 +309,7 @@ impl Upscaler for NgxVsrUpscaler {
         let pass = |ctx: &mut RecordCtx<'_>, p: &Pipeline, from: &Texture, to: &Texture| {
             let c = constants(to.width, to.height);
             let cbuf = ctx
+                .rec
                 .arena
                 .constants(&c, ctx.gpu.min_uniform_alignment)
                 .ok_or_else(|| VkError::Other("frame arena exhausted".into()))?;
@@ -330,34 +331,34 @@ impl Upscaler for NgxVsrUpscaler {
                 pipeline::sampler_write(&sampler),
                 pipeline::constants_write(&cbufs),
             ];
-            barrier(&ctx.gpu.device, ctx.cmd);
+            barrier(&ctx.gpu.device, ctx.cmd());
             // SAFETY: recording into the frame's open command buffer;
             // descriptors reference live views and the frame arena.
             unsafe {
                 ctx.gpu.device.cmd_bind_pipeline(
-                    ctx.cmd,
+                    ctx.cmd(),
                     vk::PipelineBindPoint::COMPUTE,
                     p.pipeline,
                 );
                 ctx.gpu.push_fn.cmd_push_descriptor_set(
-                    ctx.cmd,
+                    ctx.cmd(),
                     vk::PipelineBindPoint::COMPUTE,
                     ctx.layouts.compute,
                     0,
                     &writes,
                 );
             }
-            pipeline::dispatch_2d(&ctx.gpu.device, ctx.cmd, to.width, to.height);
+            pipeline::dispatch_2d(&ctx.gpu.device, ctx.cmd(), to.width, to.height);
             Ok::<_, VkError>(())
         };
 
         // 1. Working frame → PQ RGB10A2 (the shader iterates the source size).
         pass(ctx, &self.encode, src, &s.input)?;
         // 2. VSR.
-        barrier(d, ctx.cmd);
+        barrier(d, ctx.cmd());
         feature
             .evaluate(
-                ctx.cmd,
+                ctx.cmd(),
                 &image(&s.input),
                 s.src,
                 &image(&s.output),
@@ -368,7 +369,7 @@ impl Upscaler for NgxVsrUpscaler {
         // 3. PQ RGB10A2 → working frame of the target size. NGX left its own
         // pipeline bound; the pass binds ours again.
         pass(ctx, &self.decode, &s.output, out)?;
-        barrier(d, ctx.cmd);
+        barrier(d, ctx.cmd());
         Ok(())
     }
 }

@@ -307,10 +307,11 @@ fn vfx_runtime_dir(s: &Settings) -> std::path::PathBuf {
         .unwrap_or_else(|| exe.with_file_name("runtime").join("nvidia-vfx"))
 }
 
-/// Folders with the NVIDIA Video Effects runtime (`libnvidia-ngx-vsr.so`,
-/// VFG), in order: the configured folder, `$CAPTUREPLAY_VFX_RUNTIME`, then
-/// `runtime/nvidia-vfx` next to the executable or in any parent. Each may
-/// be the libraries folder itself or a wheel root (`nvvfx/libs`).
+/// Candidate folders of the NVIDIA Video Effects runtime (VFG, and
+/// `libnvidia-ngx-vsr.so` for VSR), in order: the configured folder,
+/// `$CAPTUREPLAY_VFX_RUNTIME`, then `runtime/nvidia-vfx` next to the
+/// executable or in any parent. Each may be the libraries folder itself or
+/// an unpacked `nvidia-vfx` wheel (`nvvfx/libs`).
 #[cfg(target_os = "linux")]
 fn vfx_runtime_dirs(s: &Settings) -> Vec<std::path::PathBuf> {
     let exe = std::env::current_exe().unwrap_or_default();
@@ -324,7 +325,6 @@ fn vfx_runtime_dirs(s: &Settings) -> Vec<std::path::PathBuf> {
     );
     dirs.into_iter()
         .flat_map(|d| [d.join("nvvfx").join("libs"), d])
-        .filter(|d| cp_nvidia::ngx_vk::runtime_present(d))
         .collect()
 }
 
@@ -539,10 +539,28 @@ impl State {
         }
     }
 
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
     fn vfg_interpolator(&self) -> Option<Box<dyn cp_render::Interpolator>> {
-        tracing::warn!("VFG interpolation is not available on this platform yet");
-        None
+        let Some(dir) = vfx_runtime_dirs(&self.settings)
+            .into_iter()
+            .find(|d| cp_nvidia::vfg::runtime_present(d))
+        else {
+            tracing::warn!(
+                "VFG interpolation unavailable: NVIDIA Video Effects runtime not found (see runtime/README.md)"
+            );
+            return None;
+        };
+        match cp_render::VfgInterpolator::new(
+            self.renderer.gpu(),
+            dir,
+            self.settings.interpolation.vfg_quality,
+        ) {
+            Ok(i) => Some(Box::new(i)),
+            Err(e) => {
+                tracing::warn!("VFG interpolation unavailable: {e}");
+                None
+            }
+        }
     }
 
     /// (Re)creates the upscaler when its settings changed.
@@ -603,7 +621,10 @@ impl State {
         match cp_render::NgxVsrUpscaler::new(
             self.renderer.gpu(),
             self.renderer.layouts(),
-            vfx_runtime_dirs(&self.settings),
+            vfx_runtime_dirs(&self.settings)
+                .into_iter()
+                .filter(|d| cp_nvidia::ngx_vk::runtime_present(d))
+                .collect(),
             config::data_dir().join("ngx"),
             quality,
         ) {

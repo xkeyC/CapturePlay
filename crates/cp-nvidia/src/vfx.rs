@@ -33,7 +33,8 @@ use windows::core::{HSTRING, PCSTR};
 use crate::cuda::{
     self, CUDA_EXTERNAL_MEMORY_BUFFER_DESC, CUDA_EXTERNAL_MEMORY_HANDLE_DESC,
     CUDA_EXTERNAL_SEMAPHORE_HANDLE_DESC, CUDA_EXTERNAL_SEMAPHORE_PARAMS, CUcontext, CUdevice,
-    CUdeviceptr, CUexternalMemory, CUexternalSemaphore, CUstream, Cuda, Win32Handle,
+    CUdeviceptr, CUexternalMemory, CUexternalSemaphore, CUstream, Cuda, ExternalHandle,
+    Win32Handle,
 };
 
 /// Core runtime DLLs in load order (dependencies first).
@@ -364,9 +365,11 @@ impl Bridge {
                 let mut sem = std::ptr::null_mut();
                 let desc = CUDA_EXTERNAL_SEMAPHORE_HANDLE_DESC {
                     type_: cuda::CU_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE,
-                    handle: Win32Handle {
-                        handle: handle.0,
-                        name: std::ptr::null(),
+                    handle: ExternalHandle {
+                        win32: Win32Handle {
+                            handle: handle.0,
+                            name: std::ptr::null(),
+                        },
                     },
                     flags: 0,
                     reserved: [0; 16],
@@ -522,9 +525,11 @@ impl Bridge {
             let mut memory = std::ptr::null_mut();
             let import = CUDA_EXTERNAL_MEMORY_HANDLE_DESC {
                 type_: cuda::CU_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE,
-                handle: Win32Handle {
-                    handle: handle.0,
-                    name: std::ptr::null(),
+                handle: ExternalHandle {
+                    win32: Win32Handle {
+                        handle: handle.0,
+                        name: std::ptr::null(),
+                    },
                 },
                 size: alloc.SizeInBytes,
                 flags: cuda::CUDA_EXTERNAL_MEMORY_DEDICATED,
