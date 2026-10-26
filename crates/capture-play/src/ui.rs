@@ -568,6 +568,9 @@ pub fn draw(ctx: &egui::Context, s: &mut Settings, v: &UiView<'_>) -> Vec<Action
             if st.enhance_gpu_ms > 0.0 {
                 ui.monospace(format!("{} {:5.2} ms", t.stats_enhance_gpu, st.enhance_gpu_ms));
             }
+            if let Some(d) = st.present_to_display_ms {
+                ui.monospace(format!("{} {d:5.1} ms", t.stats_display_latency));
+            }
             // Attribution required by the NVIDIA SDK licenses.
             ui.small(t.credits);
         });

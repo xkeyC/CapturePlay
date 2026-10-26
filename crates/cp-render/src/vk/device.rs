@@ -7,6 +7,10 @@ use std::ffi::{CStr, c_char};
 use ash::vk;
 use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
 
+use super::present_timing_ext::{
+    self as pt, PhysicalDevicePresentId2Features, PhysicalDevicePresentTimingFeatures,
+    PresentTimingFn,
+};
 use super::{Result, VkError};
 
 pub const VENDOR_NVIDIA: u32 = 0x10de;
@@ -14,10 +18,13 @@ pub const VENDOR_NVIDIA: u32 = 0x10de;
 /// Optional device capabilities that change how the renderer works.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Features {
-    /// `VK_KHR_present_id` + `VK_KHR_present_wait`.
-    pub present_wait: bool,
     /// `VK_EXT_swapchain_colorspace` (scRGB and HDR10 surface formats).
     pub swapchain_colorspace: bool,
+    /// `VK_EXT_present_timing` + `VK_KHR_present_id2` enabled (whether the
+    /// surface supports them is checked by the presenter).
+    pub present_timing: bool,
+    /// The `presentAtAbsoluteTime` feature is enabled.
+    pub present_at_absolute_time: bool,
 }
 
 /// The device and its queue. Owned by the render thread; the timeline
@@ -40,7 +47,9 @@ pub struct Gpu {
     pub surface_fn: ash::khr::surface::Instance,
     pub swapchain_fn: ash::khr::swapchain::Device,
     pub push_fn: ash::khr::push_descriptor::Device,
-    pub present_wait_fn: Option<ash::khr::present_wait::Device>,
+    pub surface_caps2_fn: Option<ash::khr::get_surface_capabilities2::Instance>,
+    pub present_timing_fn: Option<PresentTimingFn>,
+    pub calibrated_fn: Option<ash::khr::calibrated_timestamps::Device>,
     /// Signaled with increasing values by every submission.
     pub timeline: vk::Semaphore,
     next_value: Cell<u64>,
@@ -120,6 +129,11 @@ impl Gpu {
             if swapchain_colorspace {
                 exts.push(ash::ext::swapchain_colorspace::NAME.as_ptr());
             }
+            let surface_caps2 =
+                target.is_some() && has_ext(&available, ash::khr::get_surface_capabilities2::NAME);
+            if surface_caps2 {
+                exts.push(ash::khr::get_surface_capabilities2::NAME.as_ptr());
+            }
             let debug_layer = debug_layer && has_ext(&available, ash::ext::debug_utils::NAME);
             let validation = c"VK_LAYER_KHRONOS_validation";
             let layers: Vec<*const c_char> = if debug_layer {
@@ -185,12 +199,40 @@ impl Gpu {
             if target.is_some() {
                 enable.push(ash::khr::swapchain::NAME.as_ptr());
             }
-            let present_wait = target.is_some()
-                && has_ext(&dev_exts, ash::khr::present_id::NAME)
-                && has_ext(&dev_exts, ash::khr::present_wait::NAME);
-            if present_wait {
-                enable.push(ash::khr::present_id::NAME.as_ptr());
-                enable.push(ash::khr::present_wait::NAME.as_ptr());
+            // Present timing: extensions and features (queried through a
+            // hand-written pNext chain; the structs are newer than ash).
+            let mut timing_features = PhysicalDevicePresentTimingFeatures {
+                s_type: pt::ST_PHYSICAL_DEVICE_PRESENT_TIMING_FEATURES,
+                p_next: std::ptr::null_mut(),
+                present_timing: 0,
+                present_at_absolute_time: 0,
+                present_at_relative_time: 0,
+            };
+            let mut id2_features = PhysicalDevicePresentId2Features {
+                s_type: pt::ST_PHYSICAL_DEVICE_PRESENT_ID_2_FEATURES,
+                p_next: std::ptr::null_mut(),
+                present_id2: 0,
+            };
+            let timing_exts = surface_caps2
+                && has_ext(&dev_exts, pt::EXT_PRESENT_TIMING)
+                && has_ext(&dev_exts, pt::KHR_PRESENT_ID_2)
+                && has_ext(&dev_exts, pt::KHR_CALIBRATED_TIMESTAMPS);
+            if timing_exts {
+                timing_features.p_next = std::ptr::from_mut(&mut id2_features).cast();
+                let mut f2 = vk::PhysicalDeviceFeatures2 {
+                    p_next: std::ptr::from_mut(&mut timing_features).cast(),
+                    ..Default::default()
+                };
+                instance.get_physical_device_features2(physical, &mut f2);
+            }
+            let present_timing =
+                timing_exts && timing_features.present_timing != 0 && id2_features.present_id2 != 0;
+            let present_at_absolute_time =
+                present_timing && timing_features.present_at_absolute_time != 0;
+            if present_timing {
+                enable.push(pt::EXT_PRESENT_TIMING.as_ptr());
+                enable.push(pt::KHR_PRESENT_ID_2.as_ptr());
+                enable.push(pt::KHR_CALIBRATED_TIMESTAMPS.as_ptr());
             }
 
             let priorities = [1.0f32];
@@ -204,16 +246,19 @@ impl Gpu {
             let mut v13 = vk::PhysicalDeviceVulkan13Features::default()
                 .synchronization2(true)
                 .dynamic_rendering(true);
-            let mut pid = vk::PhysicalDevicePresentIdFeaturesKHR::default().present_id(true);
-            let mut pwait = vk::PhysicalDevicePresentWaitFeaturesKHR::default().present_wait(true);
             let mut info = vk::DeviceCreateInfo::default()
                 .queue_create_infos(&queues)
                 .enabled_extension_names(&enable)
                 .enabled_features(&base)
                 .push_next(&mut v12)
                 .push_next(&mut v13);
-            if present_wait {
-                info = info.push_next(&mut pid).push_next(&mut pwait);
+            // Only what is used: no relative-time presents.
+            timing_features.present_at_relative_time = 0;
+            if present_timing {
+                // Prepend [timing → id2] to the chain built by ash.
+                id2_features.p_next = info.p_next.cast_mut();
+                timing_features.p_next = std::ptr::from_mut(&mut id2_features).cast();
+                info.p_next = std::ptr::from_ref(&timing_features).cast();
             }
             let device = instance.create_device(physical, &info, None)?;
             let queue = device.get_device_queue(queue_family, 0);
@@ -230,12 +275,20 @@ impl Gpu {
                 min_uniform_alignment: props.limits.min_uniform_buffer_offset_alignment,
                 swapchain_fn: ash::khr::swapchain::Device::new(&instance, &device),
                 push_fn: ash::khr::push_descriptor::Device::new(&instance, &device),
-                present_wait_fn: present_wait
-                    .then(|| ash::khr::present_wait::Device::new(&instance, &device)),
+                surface_caps2_fn: surface_caps2
+                    .then(|| ash::khr::get_surface_capabilities2::Instance::new(&entry, &instance)),
+                present_timing_fn: if present_timing {
+                    PresentTimingFn::load(&instance, &device)
+                } else {
+                    None
+                },
+                calibrated_fn: present_timing
+                    .then(|| ash::khr::calibrated_timestamps::Device::new(&instance, &device)),
                 surface_fn,
                 features: Features {
-                    present_wait,
                     swapchain_colorspace,
+                    present_timing,
+                    present_at_absolute_time,
                 },
                 vendor_id: props.vendor_id,
                 adapter_name,

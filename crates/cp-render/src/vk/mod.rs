@@ -26,6 +26,7 @@ pub mod display;
 pub mod egui_pass;
 pub mod output;
 pub mod pipeline;
+pub mod present_timing_ext;
 pub mod presenter;
 pub mod renderer;
 #[cfg(test)]

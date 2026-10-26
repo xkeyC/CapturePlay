@@ -184,6 +184,9 @@ pub struct Renderer {
     stats: RenderStats,
     arrivals: Vec<(u64, HostTime)>,
     next_id: u64,
+    /// Host time of the latest present (unscheduled presents are spaced by
+    /// a refresh period, like the D3D12 waitable swapchain does).
+    last_present_ns: i64,
     gpu: Gpu,
 }
 
@@ -302,6 +305,7 @@ impl Renderer {
             stats: RenderStats::default(),
             arrivals: Vec::new(),
             next_id: 1,
+            last_present_ns: 0,
             gpu,
         })
     }
@@ -557,9 +561,17 @@ impl Renderer {
             .map(|t| t - self.lead_ns() - slack_ns(refresh))
     }
 
+    /// Refresh period: as the presentation engine reports it, else from the
+    /// window system's mode.
+    fn nominal_period_ns(&self) -> i64 {
+        self.presenter
+            .refresh_info()
+            .map_or_else(|| self.display.info().refresh_period_ns(), |(p, _)| p)
+    }
+
     /// Display timing model used for scheduling.
     fn refresh(&self) -> Refresh {
-        let nominal = self.display.info().refresh_period_ns();
+        let nominal = self.nominal_period_ns();
         let fixed = match self.config.refresh {
             RefreshMode::Auto => self.timing.kind() == RefreshKind::Fixed,
             RefreshMode::Variable => false,
@@ -738,6 +750,22 @@ impl Renderer {
     pub fn step(&mut self, ui: Option<EguiFrame<'_>>, force: bool) -> Result<PresentResult> {
         if self.display.update() {
             self.timing.reset();
+        }
+        let nominal = self.nominal_period_ns();
+        let before = self.timing.kind();
+        for (id, shown) in self.presenter.poll_timing(&self.gpu) {
+            self.timing.on_shown(id as u32, shown, nominal);
+        }
+        if let Some(ns) = self.presenter.present_to_display_ns.take() {
+            let ms = ns as f64 / 1e6;
+            let s = self.stats.present_to_display_ms.get_or_insert(ms);
+            *s = *s * 0.9 + ms * 0.1;
+        }
+        if let Some((period, variable)) = self.presenter.refresh_info() {
+            self.timing.set_reported(period, variable);
+        }
+        if self.timing.kind() != before {
+            tracing::info!(kind = ?self.timing.kind(), "display refresh detected");
         }
         self.stats.present_jitter_ms = self.timing.jitter_ms();
         self.stats.refresh_kind = self.timing.kind();
@@ -962,14 +990,29 @@ impl Renderer {
             vk::ImageLayout::PRESENT_SRC_KHR,
         );
         self.finish(Some((acquired, render_done)))?;
-        if let Some(t) = target_ns {
-            let deadline = t - slack_ns(self.refresh());
+        // Timed presents carry the target to the compositor; otherwise
+        // present at the target from here (as the D3D12 backend does).
+        // Unscheduled presents (UI repaints) are spaced by a refresh: MAILBOX
+        // would accept them as fast as they come.
+        let deadline = match target_ns {
+            Some(t) if !self.presenter.timed() => Some(t - slack_ns(self.refresh())),
+            Some(_) => None,
+            None => Some(self.last_present_ns + self.nominal_period_ns()),
+        };
+        if let Some(deadline) = deadline {
             while self.sleep.until_or(deadline, Some(&self.ingest_event)) {
                 let refresh = self.refresh();
                 self.ingest(refresh)?;
             }
         }
-        let r = self.presenter.present(&self.gpu, self.config.vsync);
+        let r = self
+            .presenter
+            .present(&self.gpu, self.config.vsync, target_ns);
+        self.last_present_ns = HostTime::now().0;
+        if let Some(t) = target_ns {
+            self.timing
+                .on_present(self.presenter.last_present_id() as u32, t);
+        }
         if let Some(a) = arrival {
             self.stats.latency_ms = (HostTime::now() - a) as f64 / 1e6;
         }
