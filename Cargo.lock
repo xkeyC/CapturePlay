@@ -558,6 +558,7 @@ version = "0.1.0"
 dependencies = [
  "ash",
  "ash-window",
+ "bitflags 2.13.2",
  "bytemuck",
  "cp-capture",
  "cp-core",
@@ -571,6 +572,7 @@ dependencies = [
  "wayland-backend",
  "wayland-client",
  "wayland-protocols",
+ "wayland-scanner",
  "windows",
  "windows-core",
 ]

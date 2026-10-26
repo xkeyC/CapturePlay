@@ -937,6 +937,8 @@ fn run(
                 ToRender::FullscreenChanged(on) => {
                     st.settings.display.start_fullscreen = on;
                     st.renderer.invalidate_display();
+                    #[cfg(target_os = "linux")]
+                    st.renderer.set_fullscreen(on);
                 }
             }
         }
