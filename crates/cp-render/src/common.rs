@@ -70,6 +70,33 @@ pub struct RenderStats {
     pub refresh_kind: RefreshKind,
     /// The schedule assumes a variable-refresh display.
     pub vrr_timing: bool,
+    /// The compositor's VRR policy for the output (Linux/KWin; `None` when
+    /// not published).
+    pub compositor_vrr: Option<CompositorVrr>,
+}
+
+/// Variable refresh as the compositor configures the window's output
+/// (KWin's "Adaptive sync").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompositorVrr {
+    /// The output cannot do variable refresh.
+    Unsupported,
+    Never,
+    /// For the active fullscreen window.
+    Automatic,
+    Always,
+}
+
+impl CompositorVrr {
+    /// Whether the compositor drives the output with variable refresh for
+    /// our window.
+    pub fn active(self, fullscreen: bool) -> bool {
+        match self {
+            Self::Unsupported | Self::Never => false,
+            Self::Automatic => fullscreen,
+            Self::Always => true,
+        }
+    }
 }
 
 /// What happened on present.

@@ -7,13 +7,26 @@
 //! brightness changed). The connector name and refresh rate come from the
 //! window system via [`DisplayTracker::set_monitor`].
 //!
+//! Variable refresh is the compositor's decision. KWin's "Adaptive sync"
+//! policy (never / automatic: for the active fullscreen window / always) is
+//! published per output by `kde_output_device_v2` (listed by
+//! `kde_output_device_registry_v2` on current KWin, one global per output
+//! before), matched to our output by connector name; it seeds the refresh detection before measurements
+//! decide. The surface is also tagged as game content (`wp_content_type_v1`),
+//! which KWin forwards to the connector's content type: HDMI TVs switch to
+//! their low-latency game mode for the fullscreen window. Tearing hints
+//! (`wp_tearing_control_v1`) and FIFO/commit timing are the Vulkan driver's
+//! business (it creates those objects for the IMMEDIATE / FIFO present
+//! modes; a second one would be a protocol error).
+//!
 //! The protocol objects live on their own event queue of the window's
 //! `wl_display`. The window thread's event loop reads the socket and
 //! libwayland routes our events to that queue; the render thread only
 //! dispatches what is pending. It must never read the socket itself: a
 //! second reader blocks in `wl_display_read_events` until the window thread
-//! reads too, i.e. until the next window event. Without the protocol (X11,
-//! other compositors) the SDR fallback is used.
+//! reads too, i.e. until the next window event. Without the protocols (X11,
+//! other compositors) the SDR fallback is used and VRR is left to
+//! measurement.
 
 use std::ffi::c_void;
 use std::ptr::NonNull;
@@ -22,14 +35,40 @@ use wayland_client::backend::{Backend, ObjectId};
 use wayland_client::protocol::wl_registry::{self, WlRegistry};
 use wayland_client::protocol::wl_surface::WlSurface;
 use wayland_client::{Connection, Dispatch, EventQueue, Proxy, QueueHandle};
+use wayland_client::{WEnum, event_created_child};
 use wayland_protocols::wp::color_management::v1::client::{
     wp_color_management_surface_feedback_v1::{self, WpColorManagementSurfaceFeedbackV1},
     wp_color_manager_v1::{self, WpColorManagerV1},
     wp_image_description_info_v1::{self, WpImageDescriptionInfoV1},
     wp_image_description_v1::{self, WpImageDescriptionV1},
 };
+use wayland_protocols::wp::content_type::v1::client::{
+    wp_content_type_manager_v1::{self, WpContentTypeManagerV1},
+    wp_content_type_v1::{self, WpContentTypeV1},
+};
 
+use self::kde::{
+    kde_output_device_mode_v2::{self, KdeOutputDeviceModeV2},
+    kde_output_device_registry_v2::{self, KdeOutputDeviceRegistryV2},
+    kde_output_device_v2::{self, KdeOutputDeviceV2},
+};
+
+use crate::common::CompositorVrr;
 use crate::display_info::DisplayInfo;
+
+/// KDE's output-device protocol (plasma-wayland-protocols, vendored: the
+/// crates.io bindings predate the registry).
+#[allow(clippy::all, missing_docs, unused_qualifications)]
+mod kde {
+    use wayland_client;
+
+    pub mod __interfaces {
+        wayland_scanner::generate_interfaces!("protocols/kde-output-device-v2.xml");
+    }
+    use self::__interfaces::*;
+
+    wayland_scanner::generate_client_code!("protocols/kde-output-device-v2.xml");
+}
 
 /// Luminances of an image description, in cd/m².
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -55,9 +94,49 @@ impl Luminances {
     }
 }
 
+/// One `kde_output_device_v2` (KWin).
+struct OutputDevice {
+    device: KdeOutputDeviceV2,
+    /// Registry name, when the device is its own global (older KWin).
+    global: Option<u32>,
+    connector: Option<String>,
+    vrr_capable: bool,
+    policy: Option<kde_output_device_v2::VrrPolicy>,
+}
+
+impl std::fmt::Debug for OutputDevice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OutputDevice")
+            .field("connector", &self.connector)
+            .field("vrr", &self.vrr())
+            .finish()
+    }
+}
+
+impl OutputDevice {
+    fn vrr(&self) -> Option<CompositorVrr> {
+        use kde_output_device_v2::VrrPolicy as P;
+        if !self.vrr_capable {
+            return Some(CompositorVrr::Unsupported);
+        }
+        Some(match self.policy? {
+            P::Never => CompositorVrr::Never,
+            P::Always => CompositorVrr::Always,
+            P::Automatic => CompositorVrr::Automatic,
+        })
+    }
+}
+
+/// Version of the vendored output-device protocol.
+const OUTPUT_DEVICE_VERSION: u32 = 26;
+/// The registry exists from this version on.
+const OUTPUT_REGISTRY_MIN_VERSION: u32 = 21;
+
 #[derive(Default)]
 struct State {
     manager: Option<(u32, u32)>,
+    content_type: Option<(u32, u32)>,
+    outputs: Vec<OutputDevice>,
     partial: Luminances,
     /// Completed information of the latest preferred description.
     done: Option<Luminances>,
@@ -79,21 +158,149 @@ impl State {
 impl Dispatch<WlRegistry, ()> for State {
     fn event(
         state: &mut Self,
-        _: &WlRegistry,
+        registry: &WlRegistry,
         event: wl_registry::Event,
+        _: &(),
+        _: &Connection,
+        qh: &QueueHandle<Self>,
+    ) {
+        match event {
+            wl_registry::Event::Global {
+                name,
+                interface,
+                version,
+            } => {
+                if interface == WpColorManagerV1::interface().name {
+                    state.manager = Some((name, version));
+                } else if interface == WpContentTypeManagerV1::interface().name {
+                    state.content_type = Some((name, version));
+                } else if interface == KdeOutputDeviceRegistryV2::interface().name
+                    && version >= OUTPUT_REGISTRY_MIN_VERSION
+                {
+                    // Announces every output now and on hotplug.
+                    let _: KdeOutputDeviceRegistryV2 =
+                        registry.bind(name, version.min(OUTPUT_DEVICE_VERSION), qh, ());
+                } else if interface == KdeOutputDeviceV2::interface().name {
+                    // Older KWin: one global per output, also when
+                    // hotplugged later.
+                    let device: KdeOutputDeviceV2 =
+                        registry.bind(name, version.min(OUTPUT_DEVICE_VERSION), qh, ());
+                    state.add_output(device, Some(name));
+                }
+            }
+            wl_registry::Event::GlobalRemove { name } => {
+                state.outputs.retain(|o| o.global != Some(name));
+            }
+            _ => {}
+        }
+    }
+}
+
+impl State {
+    fn add_output(&mut self, device: KdeOutputDeviceV2, global: Option<u32>) {
+        self.outputs.push(OutputDevice {
+            device,
+            global,
+            connector: None,
+            vrr_capable: false,
+            policy: None,
+        });
+    }
+}
+
+impl Dispatch<KdeOutputDeviceRegistryV2, ()> for State {
+    fn event(
+        state: &mut Self,
+        _: &KdeOutputDeviceRegistryV2,
+        event: kde_output_device_registry_v2::Event,
         _: &(),
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        if let wl_registry::Event::Global {
-            name,
-            interface,
-            version,
-        } = event
-            && interface == WpColorManagerV1::interface().name
-        {
-            state.manager = Some((name, version));
+        if let kde_output_device_registry_v2::Event::Output { output } = event {
+            state.add_output(output, None);
         }
+    }
+
+    event_created_child!(State, KdeOutputDeviceRegistryV2, [
+        kde_output_device_registry_v2::EVT_OUTPUT_OPCODE => (KdeOutputDeviceV2, ()),
+    ]);
+}
+
+impl Dispatch<KdeOutputDeviceV2, ()> for State {
+    fn event(
+        state: &mut Self,
+        device: &KdeOutputDeviceV2,
+        event: kde_output_device_v2::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        use kde_output_device_v2::Event as E;
+        if let E::Removed = event {
+            state.outputs.retain(|o| &o.device != device);
+            device.release();
+            return;
+        }
+        let Some(o) = state.outputs.iter_mut().find(|o| &o.device == device) else {
+            return;
+        };
+        match event {
+            E::Name { name } => o.connector = Some(name),
+            E::Capabilities {
+                flags: WEnum::Value(f),
+            } => o.vrr_capable = f.contains(kde_output_device_v2::Capability::Vrr),
+            E::VrrPolicy {
+                vrr_policy: WEnum::Value(p),
+            } => o.policy = Some(p),
+            _ => {}
+        }
+    }
+
+    event_created_child!(State, KdeOutputDeviceV2, [
+        kde_output_device_v2::EVT_MODE_OPCODE => (KdeOutputDeviceModeV2, ()),
+    ]);
+}
+
+impl Dispatch<KdeOutputDeviceModeV2, ()> for State {
+    fn event(
+        _: &mut Self,
+        mode: &KdeOutputDeviceModeV2,
+        event: kde_output_device_mode_v2::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        // Mode list: not needed (the refresh comes from the window system).
+        if let kde_output_device_mode_v2::Event::Removed = event
+            && mode.version() >= kde_output_device_mode_v2::REQ_RELEASE_SINCE
+        {
+            mode.release();
+        }
+    }
+}
+
+impl Dispatch<WpContentTypeManagerV1, ()> for State {
+    fn event(
+        _: &mut Self,
+        _: &WpContentTypeManagerV1,
+        _: wp_content_type_manager_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<WpContentTypeV1, ()> for State {
+    fn event(
+        _: &mut Self,
+        _: &WpContentTypeV1,
+        _: wp_content_type_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
     }
 }
 
@@ -186,23 +393,30 @@ impl Dispatch<WpImageDescriptionInfoV1, ()> for State {
     }
 }
 
-/// The surface's preferred image description, kept up to date.
-pub struct ColorManagement {
+/// Our protocol objects on the window's Wayland connection: the surface's
+/// preferred image description, its content type and the outputs' VRR
+/// policies, kept up to date.
+pub struct Compositor {
     conn: Connection,
     queue: EventQueue<State>,
     state: State,
-    manager: WpColorManagerV1,
-    feedback: WpColorManagementSurfaceFeedbackV1,
+    color: Option<(WpColorManagerV1, WpColorManagementSurfaceFeedbackV1)>,
+    /// Kept alive: destroying it resets the content type.
+    content_type: Option<(WpContentTypeManagerV1, WpContentTypeV1)>,
 }
 
-impl std::fmt::Debug for ColorManagement {
+impl std::fmt::Debug for Compositor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("ColorManagement")
+        f.debug_struct("Compositor")
+            .field("color_managed", &self.color.is_some())
+            .field("content_type", &self.content_type.is_some())
+            .field("outputs", &self.state.outputs)
+            .finish_non_exhaustive()
     }
 }
 
-impl ColorManagement {
-    /// Binds the color manager on the window's display.
+impl Compositor {
+    /// Binds the protocols on the window's display.
     ///
     /// # Safety
     /// `display` and `surface` must be the live `wl_display` / `wl_surface`
@@ -216,44 +430,59 @@ impl ColorManagement {
         let mut state = State::default();
         let registry = conn.display().get_registry(&qh, ());
         queue.roundtrip(&mut state).ok()?;
-        let Some((name, version)) = state.manager else {
-            tracing::info!("compositor has no wp_color_manager_v1; assuming SDR");
-            return None;
-        };
-        let manager: WpColorManagerV1 = registry.bind(
-            name,
-            version.min(WpColorManagerV1::interface().version),
-            &qh,
-            (),
-        );
         // SAFETY: caller guarantees a live wl_surface.
         let id =
             unsafe { ObjectId::from_ptr(WlSurface::interface(), surface.as_ptr().cast()) }.ok()?;
         let surface = WlSurface::from_id(&conn, id).ok()?;
-        let feedback = manager.get_surface_feedback(&surface, &qh, ());
-        let mut cm = Self {
+
+        let color = state.manager.map(|(name, version)| {
+            let manager: WpColorManagerV1 = registry.bind(
+                name,
+                version.min(WpColorManagerV1::interface().version),
+                &qh,
+                (),
+            );
+            let feedback = manager.get_surface_feedback(&surface, &qh, ());
+            (manager, feedback)
+        });
+        if color.is_none() {
+            tracing::info!("compositor has no wp_color_manager_v1; assuming SDR");
+        }
+        let content_type = state.content_type.map(|(name, version)| {
+            let manager: WpContentTypeManagerV1 = registry.bind(name, version.min(1), &qh, ());
+            let ct = manager.get_surface_content_type(&surface, &qh, ());
+            ct.set_content_type(wp_content_type_v1::Type::Game);
+            (manager, ct)
+        });
+        let mut c = Self {
             conn,
             queue,
             state,
-            manager,
-            feedback,
+            color,
+            content_type,
         };
-        cm.request();
-        // ready → get_information → done: a few roundtrips at most.
+        c.request();
+        // Output-device properties; ready → get_information → done: a few
+        // roundtrips at most.
         for _ in 0..4 {
-            if cm.state.done.is_some() || cm.state.failed {
+            let colors_done = c.color.is_none() || c.state.done.is_some() || c.state.failed;
+            let outputs_done = c.state.outputs.iter().all(|o| o.policy.is_some());
+            if colors_done && outputs_done {
                 break;
             }
-            cm.queue.roundtrip(&mut cm.state).ok()?;
+            c.queue.roundtrip(&mut c.state).ok()?;
         }
-        Some(cm)
+        tracing::info!(compositor = ?c, "wayland display protocols");
+        Some(c)
     }
 
     fn request(&mut self) {
         self.state.changed = false;
         self.state.failed = false;
         self.state.drop_desc();
-        self.state.desc = Some(self.feedback.get_preferred(&self.queue.handle(), ()));
+        if let Some((_, feedback)) = &self.color {
+            self.state.desc = Some(feedback.get_preferred(&self.queue.handle(), ()));
+        }
     }
 
     /// Processes events the window thread already read (never blocks);
@@ -267,13 +496,28 @@ impl ColorManagement {
         }
         self.state.done.take()
     }
+
+    /// The compositor's VRR policy for the output named `connector`.
+    fn vrr(&self, connector: &str) -> Option<CompositorVrr> {
+        self.state
+            .outputs
+            .iter()
+            .find(|o| o.connector.as_deref() == Some(connector))
+            .and_then(OutputDevice::vrr)
+    }
 }
 
-impl Drop for ColorManagement {
+impl Drop for Compositor {
     fn drop(&mut self) {
         self.state.drop_desc();
-        self.feedback.destroy();
-        self.manager.destroy();
+        if let Some((manager, feedback)) = self.color.take() {
+            feedback.destroy();
+            manager.destroy();
+        }
+        if let Some((manager, ct)) = self.content_type.take() {
+            ct.destroy();
+            manager.destroy();
+        }
         let _ = self.conn.flush();
     }
 }
@@ -281,26 +525,34 @@ impl Drop for ColorManagement {
 /// Tracks the current display; see the module docs.
 #[derive(Debug)]
 pub struct DisplayTracker {
-    cm: Option<ColorManagement>,
+    compositor: Option<Compositor>,
     luminances: Option<Luminances>,
     monitor: Option<(String, f64)>,
     info: DisplayInfo,
+    vrr: Option<CompositorVrr>,
 }
 
 impl DisplayTracker {
-    pub fn new(cm: Option<ColorManagement>) -> Self {
+    pub fn new(compositor: Option<Compositor>) -> Self {
         let mut t = Self {
-            cm,
+            compositor,
             luminances: None,
             monitor: None,
             info: DisplayInfo::fallback(),
+            vrr: None,
         };
-        if let Some(l) = t.cm.as_mut().and_then(|c| c.state.done.take()) {
+        if let Some(l) = t.compositor.as_mut().and_then(|c| c.state.done.take()) {
             t.luminances = Some(l);
         }
         t.info = t.compose();
         tracing::info!(info = ?t.info, luminances = ?t.luminances, "display");
         t
+    }
+
+    /// The compositor's variable-refresh policy for our output, when it
+    /// publishes one (KWin).
+    pub fn vrr(&self) -> Option<CompositorVrr> {
+        self.vrr
     }
 
     pub fn info(&self) -> &DisplayInfo {
@@ -339,17 +591,28 @@ impl DisplayTracker {
         info
     }
 
-    /// Processes compositor updates. Returns `true` when the info changed.
+    /// Processes compositor updates. Returns `true` when the display itself
+    /// changed (another output, mode, HDR or VRR policy), not merely its
+    /// reference luminance.
     pub fn update(&mut self) -> bool {
-        if let Some(l) = self.cm.as_mut().and_then(ColorManagement::poll) {
+        if let Some(l) = self.compositor.as_mut().and_then(Compositor::poll) {
             self.luminances = Some(l);
+        }
+        let vrr = match (&self.compositor, &self.monitor) {
+            (Some(c), Some((name, _))) => c.vrr(name),
+            _ => None,
+        };
+        let vrr_changed = vrr != self.vrr;
+        if vrr_changed {
+            tracing::info!(?vrr, "compositor VRR policy");
+            self.vrr = vrr;
         }
         let info = self.compose();
         if info == self.info {
-            return false;
+            return vrr_changed;
         }
         // KDE animates the reference luminance (brightness slider, idle
-        // dimming); only report other changes loudly.
+        // dimming); that is not a display change.
         let reference_only = DisplayInfo {
             sdr_white_nits: self.info.sdr_white_nits,
             ..info.clone()
@@ -363,7 +626,7 @@ impl DisplayTracker {
             tracing::info!(?info, "display changed");
         }
         self.info = info;
-        true
+        vrr_changed || !reference_only
     }
 }
 

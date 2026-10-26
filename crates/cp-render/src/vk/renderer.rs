@@ -21,7 +21,7 @@ use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
 use super::clock::{Event, PreciseSleep};
 use super::convert::ConvertPass;
 use super::device::Gpu;
-use super::display::{ColorManagement, DisplayTracker};
+use super::display::{Compositor, DisplayTracker};
 use super::egui_pass::EguiPass;
 use super::output::OutputPass;
 use super::pipeline::Layouts;
@@ -196,6 +196,8 @@ pub struct Renderer {
     /// Host time of the latest present (unscheduled presents are spaced by
     /// a refresh period, like the D3D12 waitable swapchain does).
     last_present_ns: i64,
+    /// The window is fullscreen (KWin's automatic VRR applies).
+    fullscreen: bool,
     gpu: Gpu,
 }
 
@@ -228,7 +230,7 @@ impl Renderer {
                 // SAFETY: the window (and with it the display) outlives the
                 // renderer: the render thread is joined before the window
                 // is dropped.
-                unsafe { ColorManagement::new(d.display, w.surface) }
+                unsafe { Compositor::new(d.display, w.surface) }
             }
             _ => None,
         };
@@ -298,6 +300,7 @@ impl Renderer {
             arrivals: Vec::new(),
             next_id: 1,
             last_present_ns: 0,
+            fullscreen: false,
             gpu,
         })
     }
@@ -550,6 +553,14 @@ impl Renderer {
         self.timing.reset();
     }
 
+    /// The window entered or left fullscreen.
+    pub fn set_fullscreen(&mut self, on: bool) {
+        if on != self.fullscreen {
+            self.fullscreen = on;
+            self.timing.reset();
+        }
+    }
+
     /// Next time (ns) the render loop should wake for a scheduled slot.
     pub fn next_deadline(&self) -> Option<i64> {
         let refresh = self.refresh();
@@ -749,6 +760,9 @@ impl Renderer {
         if let Some((period, variable)) = self.presenter.refresh_info() {
             self.timing.set_reported(period, variable);
         }
+        let vrr = self.display.vrr();
+        self.timing.set_hint(vrr.map(|v| v.active(self.fullscreen)));
+        self.stats.compositor_vrr = vrr;
         if self.timing.kind() != before {
             tracing::info!(kind = ?self.timing.kind(), "display refresh detected");
         }

@@ -106,6 +106,8 @@ cargo build --release
 
 Status: capture, color conversion, HDR output (scRGB, mapped through the compositor's reference luminance), the UI, present-timing feedback (`VK_EXT_present_timing`) and PipeWire audio passthrough work; interpolation (VFG, CUDA ↔ Vulkan interop) and upscaling (VSR, NGX on Vulkan) are implemented, need the NVIDIA Video Effects runtime (see `runtime/README.md`) and await validation on real hardware; NR is not supported. Settings live in `$XDG_CONFIG_HOME/CapturePlay/` (default `~/.config/CapturePlay/`); `CAPTUREPLAY_VK_DEBUG=1` enables the Vulkan validation layer, `CAPTUREPLAY_VK_TIMED_PRESENT=1` tries presenting at target times (experimental).
 
+VRR is KWin's call: set Display Settings → Adaptive sync to "Automatic" (applies to the active fullscreen window) or "Always", then go fullscreen with F11. The app reads that policy as the starting point of the refresh detection and tags its window as game content, so TVs switch to their low-latency game mode. With V-Sync off, allow tearing in fullscreen in KDE.
+
 ### 1.7 Notes
 
 - HDR requires both the display and Windows HDR to be enabled; the swapchain reapplies its output contract after fullscreen or window changes.

@@ -6,7 +6,9 @@
 //! display times gives the presentation jitter, and tells variable-refresh
 //! displays from fixed-refresh ones: when off-grid targets still land on a
 //! regular vblank grid the display is fixed-refresh; when they land where
-//! they were aimed, VRR is active.
+//! they were aimed, VRR is active. Until the measurements decide, what the
+//! presentation engine reports and then what the platform says about the
+//! display (the compositor's VRR policy) stand in.
 
 use std::collections::VecDeque;
 
@@ -48,6 +50,8 @@ pub struct PresentTiming {
     vblank: Option<(u32, i64)>,
     /// Period and variable-refresh flag reported by the presentation engine.
     reported: Option<(i64, Option<bool>)>,
+    /// Variable refresh as the platform configures the display.
+    hint: Option<bool>,
 }
 
 impl PresentTiming {
@@ -61,13 +65,22 @@ impl PresentTiming {
     }
 
     /// The measured behaviour; before the measurements decide, what the
-    /// presentation engine reported (if anything).
+    /// presentation engine reported, else the platform hint (if any).
     pub fn kind(&self) -> RefreshKind {
-        match (self.kind, self.reported) {
-            (RefreshKind::Unknown, Some((_, Some(true)))) => RefreshKind::Variable,
-            (RefreshKind::Unknown, Some((_, Some(false)))) => RefreshKind::Fixed,
-            (k, _) => k,
+        if self.kind != RefreshKind::Unknown {
+            return self.kind;
         }
+        match self.reported.and_then(|(_, v)| v).or(self.hint) {
+            Some(true) => RefreshKind::Variable,
+            Some(false) => RefreshKind::Fixed,
+            None => RefreshKind::Unknown,
+        }
+    }
+
+    /// Whether the platform runs the display with variable refresh (the
+    /// compositor's policy), weaker than any measurement.
+    pub fn set_hint(&mut self, variable: Option<bool>) {
+        self.hint = variable;
     }
 
     /// Refresh reported by the presentation engine (Vulkan present timing):
@@ -230,6 +243,19 @@ mod tests {
                 P,
             );
         }
+    }
+
+    #[test]
+    fn hint_yields_to_reports_and_measurements() {
+        let mut t = PresentTiming::default();
+        t.set_hint(Some(true));
+        assert_eq!(t.kind(), RefreshKind::Variable);
+        t.set_reported(P, Some(false));
+        assert_eq!(t.kind(), RefreshKind::Fixed);
+        let mut t = PresentTiming::default();
+        t.set_hint(Some(true));
+        feed(&mut t, |target| (target / P + 1) * P);
+        assert_eq!(t.kind(), RefreshKind::Fixed);
     }
 
     #[test]

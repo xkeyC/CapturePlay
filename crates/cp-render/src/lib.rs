@@ -56,7 +56,7 @@ mod testutil;
 #[cfg(all(test, windows))]
 mod upscale_bench;
 
-pub use common::{EguiFrame, PresentResult, RenderConfig, RenderStats};
+pub use common::{CompositorVrr, EguiFrame, PresentResult, RenderConfig, RenderStats};
 pub use display_info::DisplayInfo;
 #[cfg(windows)]
 pub use interp_vfg::VfgInterpolator;

@@ -106,6 +106,8 @@ cargo build --release
 
 当前状态：采集、色彩转换、HDR 输出（scRGB，按 compositor 的参考亮度换算）、UI、呈现时序反馈（`VK_EXT_present_timing`）、PipeWire 音频直通可用；补帧（VFG，CUDA ↔ Vulkan 互操作）与超分（VSR，NGX on Vulkan）已实现，需要 NVIDIA Video Effects 运行库（见 `runtime/README.md`），待实机验证；NR 不支持。设置位于 `$XDG_CONFIG_HOME/CapturePlay/`（默认 `~/.config/CapturePlay/`），`CAPTUREPLAY_VK_DEBUG=1` 启用 Vulkan 验证层，`CAPTUREPLAY_VK_TIMED_PRESENT=1` 试用按目标时间呈现（实验）。
 
+VRR 由 KWin 决定：在“显示设置 → 自适应同步”中选“自动”（仅对全屏的活动窗口生效）或“始终”，再按 F11 全屏；程序读取该策略作为刷新检测的初值，并把窗口标记为游戏内容，使电视进入低延迟游戏模式。关闭垂直同步时，需在 KDE 中允许全屏撕裂。
+
 ### 1.7 注意事项
 
 - HDR 需要显示器与 Windows HDR 同时开启；切换全屏或窗口后交换链会重新应用输出合约。

@@ -11,7 +11,7 @@ use cp_core::settings::{
     Settings, UpscaleBackend, VsrQualitySetting,
 };
 use cp_core::{ColorDesc, Range, TransferFunction, VideoMode};
-use cp_render::{DisplayInfo, RefreshKind, RenderStats};
+use cp_render::{CompositorVrr, DisplayInfo, RefreshKind, RenderStats};
 
 use crate::i18n::{self, Strings};
 
@@ -177,7 +177,16 @@ fn timing_label(t: &Strings, st: &RenderStats) -> String {
     let jitter = st
         .present_jitter_ms
         .map_or_else(String::new, |j| format!(" · {} {j:.2} ms", t.stats_jitter));
-    format!("{kind}\n{schedule}{jitter}")
+    let compositor = st.compositor_vrr.map_or_else(String::new, |v| {
+        let policy = match v {
+            CompositorVrr::Unsupported => t.vrr_unsupported,
+            CompositorVrr::Never => t.vrr_never,
+            CompositorVrr::Automatic => t.vrr_automatic,
+            CompositorVrr::Always => t.vrr_always,
+        };
+        format!("\n{}: {policy}", t.compositor_vrr)
+    });
+    format!("{kind}\n{schedule}{jitter}{compositor}")
 }
 
 fn mode_key(m: &VideoMode) -> String {
