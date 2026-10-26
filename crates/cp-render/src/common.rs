@@ -51,6 +51,9 @@ pub struct RenderStats {
     pub color: Option<cp_core::ColorDesc>,
     /// Capture arrival → present call, last frame (ms).
     pub latency_ms: f64,
+    /// Present call → first pixel out (ms, smoothed), where the platform
+    /// reports it (Vulkan present timing).
+    pub present_to_display_ms: Option<f64>,
     /// GPU time to produce one interpolated frame (ms, smoothed), including
     /// optical-flow / CUDA work the queue waited for.
     pub interp_gpu_ms: f64,

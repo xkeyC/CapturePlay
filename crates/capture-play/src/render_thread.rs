@@ -356,6 +356,10 @@ impl RateMeter {
             interp = format!("{:.1}", self.rates.interp_fps),
             content = format!("{:.1}", s.content_fps),
             latency_ms = format!("{:.1}", s.latency_ms),
+            display_ms = s
+                .present_to_display_ms
+                .map(|d| format!("{d:.1}"))
+                .unwrap_or_default(),
             interp_gpu_ms = format!("{:.2}", s.interp_gpu_ms),
             enhance_gpu_ms = format!("{:.2}", s.enhance_gpu_ms),
             upscale = s

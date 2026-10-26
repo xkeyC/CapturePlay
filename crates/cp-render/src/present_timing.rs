@@ -1,7 +1,8 @@
 //! When presented frames actually reached the screen.
 //!
 //! DXGI frame statistics report, for the latest displayed present, the QPC
-//! time of the refresh that showed it. Matching those against the intended
+//! time of the refresh that showed it ([`PresentTiming::on_stats`]); Vulkan
+//! present timing reports it for every present ([`PresentTiming::on_shown`]). Matching those against the intended
 //! display times gives the presentation jitter, and tells variable-refresh
 //! displays from fixed-refresh ones: when off-grid targets still land on a
 //! regular vblank grid the display is fixed-refresh; when they land where
@@ -45,6 +46,8 @@ pub struct PresentTiming {
     /// First and latest (refresh count, time), for the true refresh period.
     anchor: Option<(u32, i64)>,
     vblank: Option<(u32, i64)>,
+    /// Period and variable-refresh flag reported by the presentation engine.
+    reported: Option<(i64, Option<bool>)>,
 }
 
 impl PresentTiming {
@@ -57,8 +60,42 @@ impl PresentTiming {
         *self = Self::default();
     }
 
+    /// The measured behaviour; before the measurements decide, what the
+    /// presentation engine reported (if anything).
     pub fn kind(&self) -> RefreshKind {
-        self.kind
+        match (self.kind, self.reported) {
+            (RefreshKind::Unknown, Some((_, Some(true)))) => RefreshKind::Variable,
+            (RefreshKind::Unknown, Some((_, Some(false)))) => RefreshKind::Fixed,
+            (k, _) => k,
+        }
+    }
+
+    /// Refresh reported by the presentation engine (Vulkan present timing):
+    /// the period (minimum period when variable) and whether it is variable.
+    pub fn set_reported(&mut self, period_ns: i64, variable: Option<bool>) {
+        self.reported = Some((period_ns, variable));
+    }
+
+    /// Present `id` reached the screen at `shown_ns` (per-present feedback:
+    /// an exact sample, and on fixed refresh a vblank).
+    pub fn on_shown(&mut self, id: u32, shown_ns: i64, nominal_period_ns: i64) {
+        self.vblank = Some((self.vblank.map_or(0, |(c, _)| c), shown_ns));
+        while let Some(&(pid, target)) = self.pending.front() {
+            if pid > id {
+                break;
+            }
+            self.pending.pop_front();
+            if pid == id {
+                self.add_sample(
+                    Sample {
+                        id,
+                        target,
+                        shown: shown_ns,
+                    },
+                    nominal_period_ns,
+                );
+            }
+        }
     }
 
     /// A scheduled frame was presented as `id`, meant to appear at `target`.
@@ -133,8 +170,13 @@ impl PresentTiming {
         }
     }
 
-    /// Measured refresh period (falls back to the nominal one).
+    /// Measured (or engine-reported) refresh period, else the nominal one.
     pub fn period_ns(&self, nominal_ns: i64) -> i64 {
+        if let Some((p, _)) = self.reported
+            && p > 0
+        {
+            return p;
+        }
         if let (Some((c0, t0)), Some((c1, t1))) = (self.anchor, self.vblank)
             && c1.wrapping_sub(c0) >= 120
         {
@@ -196,6 +238,38 @@ mod tests {
         feed(&mut t, |target| target + 300_000);
         assert_eq!(t.kind(), RefreshKind::Variable);
         assert!(t.jitter_ms().expect("samples") < 0.01);
+    }
+
+    /// Per-present feedback (Vulkan): every frame reports its own time.
+    fn feed_shown(t: &mut PresentTiming, shown: impl Fn(i64) -> i64) {
+        for i in 0..80u32 {
+            let target = 1_000_000_000 + i64::from(i) * STEP;
+            t.on_present(i + 1, target);
+            t.on_shown(i + 1, shown(target), P);
+        }
+    }
+
+    #[test]
+    fn per_present_feedback_classifies_like_frame_stats() {
+        let mut vrr = PresentTiming::default();
+        feed_shown(&mut vrr, |target| target + 300_000);
+        assert_eq!(vrr.kind(), RefreshKind::Variable);
+        let mut frr = PresentTiming::default();
+        feed_shown(&mut frr, |target| (target / P + 1) * P);
+        assert_eq!(frr.kind(), RefreshKind::Fixed);
+        assert_eq!(frr.vblank_ns().map(|v| v % P), Some(0));
+    }
+
+    #[test]
+    fn reported_refresh_until_measured() {
+        let mut t = PresentTiming::default();
+        assert_eq!(t.kind(), RefreshKind::Unknown);
+        t.set_reported(4_166_000, Some(false));
+        assert_eq!(t.kind(), RefreshKind::Fixed);
+        assert_eq!(t.period_ns(16_666_667), 4_166_000);
+        // Measurements override the report.
+        feed_shown(&mut t, |target| target + 300_000);
+        assert_eq!(t.kind(), RefreshKind::Variable);
     }
 
     #[test]
