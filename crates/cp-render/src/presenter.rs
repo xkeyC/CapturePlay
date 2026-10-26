@@ -21,6 +21,7 @@ use windows::Win32::Graphics::Dxgi::*;
 use windows::Win32::System::Threading::WaitForSingleObjectEx;
 use windows::core::{Interface, Result};
 
+use crate::common::PresentResult;
 use crate::descriptors::{CpuDescriptor, StagingHeap};
 use crate::display::DisplayTracker;
 use crate::gpu::Gpu;
@@ -50,15 +51,6 @@ impl std::fmt::Debug for Presenter {
             .field("size", &(self.width, self.height))
             .finish()
     }
-}
-
-/// What happened on present.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PresentResult {
-    Ok,
-    /// Window occluded/minimized; skip rendering until visible.
-    Occluded,
-    DeviceLost,
 }
 
 impl Presenter {

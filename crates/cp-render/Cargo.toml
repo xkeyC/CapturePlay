@@ -1,6 +1,6 @@
 [package]
 name = "cp-render"
-description = "D3D12 renderer: upload, color conversion, interpolation, HDR presentation, egui overlay."
+description = "Renderer (D3D12 on Windows, Vulkan on Linux): upload, color conversion, interpolation, HDR presentation, egui overlay."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -12,12 +12,26 @@ build = "build.rs"
 cp-core.workspace = true
 cp-capture.workspace = true
 cp-nvidia.workspace = true
-windows.workspace = true
-windows-core.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 bytemuck.workspace = true
 egui.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows.workspace = true
+windows-core.workspace = true
+
+[dev-dependencies]
+tracing-subscriber.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+ash.workspace = true
+ash-window.workspace = true
+raw-window-handle.workspace = true
+libc.workspace = true
+wayland-client.workspace = true
+wayland-backend.workspace = true
+wayland-protocols.workspace = true
 
 [lints]
 workspace = true

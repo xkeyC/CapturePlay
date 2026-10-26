@@ -1,8 +1,14 @@
-//! Compiles HLSL to signed DXIL with the Windows SDK's `dxc.exe`.
+//! Compiles the HLSL shaders with DXC: signed DXIL for the D3D12 backend
+//! (Windows SDK `dxc.exe`), SPIR-V for the Vulkan backend (`dxc` on Linux).
 //!
 //! Override the compiler with `DXC_PATH`. Shaders are embedded with
 //! `include_bytes!` from `OUT_DIR`, so the binary has no runtime compiler
 //! dependency.
+//!
+//! SPIR-V binding model (set 0): `tN` → binding N, `uN` → 8 + N, `s0` →
+//! 16 (immutable sampler), the `b0` constant buffer → 24 (a uniform buffer
+//! with D3D layout, filled per draw). Vertex shaders flip Y so both backends
+//! share the D3D clip-space convention.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -130,9 +136,18 @@ const SHADERS: &[Shader] = &[
     },
 ];
 
-fn find_dxc() -> PathBuf {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Target {
+    Dxil,
+    Spirv,
+}
+
+fn find_dxc(target: Target) -> PathBuf {
     if let Ok(p) = std::env::var("DXC_PATH") {
         return PathBuf::from(p);
+    }
+    if target == Target::Spirv {
+        return PathBuf::from("dxc");
     }
     let base = Path::new(r"C:\Program Files (x86)\Windows Kits\10\bin");
     let mut versions: Vec<PathBuf> = std::fs::read_dir(base)
@@ -151,18 +166,40 @@ fn find_dxc() -> PathBuf {
 }
 
 fn main() {
-    let dxc = find_dxc();
+    println!("cargo:rerun-if-changed=shaders");
+    println!("cargo:rerun-if-env-changed=DXC_PATH");
+    let target = match std::env::var("CARGO_CFG_TARGET_OS").as_deref() {
+        Ok("windows") => Target::Dxil,
+        Ok("linux") => Target::Spirv,
+        _ => return,
+    };
+    let dxc = find_dxc(target);
     let src_dir =
         PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("manifest dir")).join("shaders");
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("out dir"));
-    println!("cargo:rerun-if-changed=shaders");
-    println!("cargo:rerun-if-env-changed=DXC_PATH");
 
     for s in SHADERS {
-        let out = out_dir.join(format!("{}.cso", s.out));
         let mut cmd = Command::new(&dxc);
-        cmd.arg("-nologo")
-            .args(["-T", s.profile, "-E", s.entry])
+        let out = match target {
+            Target::Dxil => {
+                cmd.arg("-nologo");
+                out_dir.join(format!("{}.cso", s.out))
+            }
+            Target::Spirv => {
+                cmd.args(["-spirv", "-fspv-target-env=vulkan1.3", "-fvk-use-dx-layout"])
+                    .args(["-fvk-u-shift", "8", "0"])
+                    .args(["-fvk-s-shift", "16", "0"])
+                    .args(["-fvk-b-shift", "24", "0"])
+                    // Storage images are FP16 / R10G10B10A2; no format in
+                    // the shader (shaderStorageImageWriteWithoutFormat).
+                    .arg("-fspv-use-unknown-image-format");
+                if s.profile.starts_with("vs_") {
+                    cmd.arg("-fvk-invert-y");
+                }
+                out_dir.join(format!("{}.spv", s.out))
+            }
+        };
+        cmd.args(["-T", s.profile, "-E", s.entry])
             .args(["-O3", "-Zpr", "-HV", "2021"])
             .arg("-I")
             .arg(&src_dir)

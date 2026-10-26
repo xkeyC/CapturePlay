@@ -315,16 +315,49 @@ pub static EN: Strings = Strings {
     stats_interp_gpu: "Interp GPU time/frame",
 };
 
-/// Resolves `Auto` from the Windows UI language.
+/// Resolves `Auto` from the system UI language.
 pub fn resolve(lang: Language) -> &'static Strings {
     match lang {
         Language::Zh => &ZH,
         Language::En => &EN,
-        Language::Auto => {
-            // SAFETY: no preconditions.
-            let id = unsafe { windows::Win32::Globalization::GetUserDefaultUILanguage() };
-            // Primary language id 0x04 = Chinese.
-            if id & 0x3ff == 0x04 { &ZH } else { &EN }
-        }
+        Language::Auto if system_prefers_chinese() => &ZH,
+        Language::Auto => &EN,
+    }
+}
+
+#[cfg(windows)]
+fn system_prefers_chinese() -> bool {
+    // SAFETY: no preconditions.
+    let id = unsafe { windows::Win32::Globalization::GetUserDefaultUILanguage() };
+    // Primary language id 0x04 = Chinese.
+    id & 0x3ff == 0x04
+}
+
+/// POSIX message locale: the first non-empty of `LC_ALL`, `LC_MESSAGES`,
+/// `LANG` (e.g. `zh_CN.UTF-8`).
+#[cfg(not(windows))]
+fn system_prefers_chinese() -> bool {
+    ["LC_ALL", "LC_MESSAGES", "LANG"]
+        .iter()
+        .filter_map(|v| std::env::var(v).ok())
+        .find(|s| !s.is_empty())
+        .is_some_and(|s| locale_is_chinese(&s))
+}
+
+#[cfg(not(windows))]
+fn locale_is_chinese(locale: &str) -> bool {
+    locale
+        .get(..2)
+        .is_some_and(|p| p.eq_ignore_ascii_case("zh"))
+}
+
+#[cfg(all(test, not(windows)))]
+mod tests {
+    #[test]
+    fn posix_locales() {
+        assert!(super::locale_is_chinese("zh_CN.UTF-8"));
+        assert!(super::locale_is_chinese("zh_TW"));
+        assert!(!super::locale_is_chinese("en_US.UTF-8"));
+        assert!(!super::locale_is_chinese("C"));
     }
 }

@@ -5,18 +5,32 @@
 //! thread records the GPU copy) → InFlight(fence) → Free`. When the renderer
 //! falls behind, the capture thread recycles the *oldest* ready frame rather
 //! than dropping the newest one, so latency never accumulates.
+//!
+//! The slot logic is backend independent; [`UploadMemory`] supplies the
+//! mapped buffers and the GPU completion value (D3D12 fence, Vulkan
+//! timeline semaphore).
 
 use std::sync::{Arc, Mutex};
 
 use cp_capture::{FrameDest, FrameMeta, FrameSink, PlaneDest};
 use cp_core::{PixelFormat, VideoMode};
-use windows::Win32::Graphics::Direct3D12::*;
-
-use crate::gpu::{buffer_desc, heap_props};
 
 pub const SLOT_COUNT: usize = 4;
-const PITCH_ALIGN: usize = D3D12_TEXTURE_DATA_PITCH_ALIGNMENT as usize;
-const PLACEMENT_ALIGN: usize = D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT as usize;
+/// D3D12's texture-copy footprint rules (`D3D12_TEXTURE_DATA_PITCH_ALIGNMENT`,
+/// `..._PLACEMENT_ALIGNMENT`); they also satisfy Vulkan's buffer → image copy
+/// rules for every plane format used.
+const PITCH_ALIGN: usize = 256;
+const PLACEMENT_ALIGN: usize = 512;
+
+/// GPU memory behind an [`UploadRing`].
+pub trait UploadMemory: Send + Sync + 'static {
+    /// A persistently mapped upload buffer; dropping the last clone frees it.
+    type Buffer: Clone + Send;
+    /// Allocates and maps a buffer of `size` bytes.
+    fn allocate(&self, size: usize) -> Option<(Self::Buffer, *mut u8)>;
+    /// Latest GPU timeline value known to have completed.
+    fn completed(&self) -> u64;
+}
 
 /// Byte layout of one frame inside an upload slot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,8 +71,8 @@ enum SlotState {
     InFlight(u64),
 }
 
-struct Slot {
-    buffer: Option<ID3D12Resource>,
+struct Slot<B> {
+    buffer: Option<B>,
     ptr: *mut u8,
     capacity: usize,
     state: SlotState,
@@ -68,7 +82,7 @@ struct Slot {
 
 // SAFETY: `ptr` is a persistent mapping of `buffer`, accessed only by the
 // thread that currently owns the slot according to `state`.
-unsafe impl Send for Slot {}
+unsafe impl<B: Send> Send for Slot<B> {}
 
 /// A frame ready for the renderer.
 #[derive(Debug)]
@@ -78,27 +92,22 @@ pub struct ReadyFrame {
     pub layout: SlotLayout,
 }
 
-pub struct UploadRing {
-    device: ID3D12Device,
-    fence: ID3D12Fence,
-    slots: Mutex<Vec<Slot>>,
+pub struct UploadRing<M: UploadMemory> {
+    memory: M,
+    slots: Mutex<Vec<Slot<M::Buffer>>>,
     wake: Box<dyn Fn() + Send + Sync>,
     recycled: std::sync::atomic::AtomicU64,
 }
 
-impl std::fmt::Debug for UploadRing {
+impl<M: UploadMemory> std::fmt::Debug for UploadRing<M> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("UploadRing").finish_non_exhaustive()
     }
 }
 
-impl UploadRing {
+impl<M: UploadMemory> UploadRing<M> {
     /// `wake` is called (on the capture thread) whenever a frame is ready.
-    pub fn new(
-        device: ID3D12Device,
-        fence: ID3D12Fence,
-        wake: impl Fn() + Send + Sync + 'static,
-    ) -> Arc<Self> {
+    pub fn new(memory: M, wake: impl Fn() + Send + Sync + 'static) -> Arc<Self> {
         let slots = (0..SLOT_COUNT)
             .map(|_| Slot {
                 buffer: None,
@@ -117,8 +126,7 @@ impl UploadRing {
             })
             .collect();
         Arc::new(Self {
-            device,
-            fence,
+            memory,
             slots: Mutex::new(slots),
             wake: Box::new(wake),
             recycled: Default::default(),
@@ -153,7 +161,7 @@ impl UploadRing {
     }
 
     /// Upload buffer of a taken slot (for recording the GPU copy).
-    pub fn buffer(&self, slot: usize) -> Option<ID3D12Resource> {
+    pub fn buffer(&self, slot: usize) -> Option<M::Buffer> {
         self.slots.lock().ok()?.get(slot)?.buffer.clone()
     }
 
@@ -171,51 +179,27 @@ impl UploadRing {
         }
     }
 
-    fn ensure_capacity(&self, s: &mut Slot, size: usize) -> bool {
+    fn ensure_capacity(&self, s: &mut Slot<M::Buffer>, size: usize) -> bool {
         if s.capacity >= size && s.buffer.is_some() {
             return true;
         }
         s.buffer = None;
         s.ptr = std::ptr::null_mut();
         s.capacity = 0;
-        let desc = buffer_desc(size as u64, D3D12_RESOURCE_FLAG_NONE);
-        let mut res: Option<ID3D12Resource> = None;
-        // SAFETY: creating and mapping an upload buffer; the mapping stays
-        // valid for the resource lifetime (upload heaps may stay mapped).
-        unsafe {
-            if self
-                .device
-                .CreateCommittedResource(
-                    &heap_props(D3D12_HEAP_TYPE_UPLOAD),
-                    D3D12_HEAP_FLAG_NONE,
-                    &desc,
-                    D3D12_RESOURCE_STATE_GENERIC_READ,
-                    None,
-                    &mut res,
-                )
-                .is_err()
-            {
-                return false;
-            }
-            let Some(res) = res else { return false };
-            let mut ptr = std::ptr::null_mut();
-            let no_read = D3D12_RANGE { Begin: 0, End: 0 };
-            if res.Map(0, Some(&no_read), Some(&mut ptr)).is_err() {
-                return false;
-            }
-            s.ptr = ptr.cast();
-            s.buffer = Some(res);
-        }
+        let Some((buffer, ptr)) = self.memory.allocate(size) else {
+            return false;
+        };
+        s.buffer = Some(buffer);
+        s.ptr = ptr;
         s.capacity = size;
         true
     }
 }
 
-impl FrameSink for UploadRing {
+impl<M: UploadMemory> FrameSink for UploadRing<M> {
     fn acquire(&self, mode: &VideoMode) -> Option<FrameDest> {
         let layout = SlotLayout::for_mode(mode.format, mode.width, mode.height);
-        // SAFETY: plain fence query.
-        let completed = unsafe { self.fence.GetCompletedValue() };
+        let completed = self.memory.completed();
         let mut slots = self.slots.lock().ok()?;
         for s in slots.iter_mut() {
             if let SlotState::InFlight(v) = s.state
@@ -272,12 +256,58 @@ impl FrameSink for UploadRing {
     }
 }
 
+/// Committed upload-heap buffers, completion from the device fence.
+#[cfg(windows)]
+#[derive(Debug)]
+pub struct D3d12UploadMemory {
+    pub device: windows::Win32::Graphics::Direct3D12::ID3D12Device,
+    pub fence: windows::Win32::Graphics::Direct3D12::ID3D12Fence,
+}
+
+#[cfg(windows)]
+impl UploadMemory for D3d12UploadMemory {
+    type Buffer = windows::Win32::Graphics::Direct3D12::ID3D12Resource;
+
+    fn allocate(&self, size: usize) -> Option<(Self::Buffer, *mut u8)> {
+        use windows::Win32::Graphics::Direct3D12::*;
+
+        use crate::gpu::{buffer_desc, heap_props};
+
+        let desc = buffer_desc(size as u64, D3D12_RESOURCE_FLAG_NONE);
+        let mut res: Option<ID3D12Resource> = None;
+        // SAFETY: creating and mapping an upload buffer; the mapping stays
+        // valid for the resource lifetime (upload heaps may stay mapped).
+        unsafe {
+            self.device
+                .CreateCommittedResource(
+                    &heap_props(D3D12_HEAP_TYPE_UPLOAD),
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    D3D12_RESOURCE_STATE_GENERIC_READ,
+                    None,
+                    &mut res,
+                )
+                .ok()?;
+            let res = res?;
+            let mut ptr = std::ptr::null_mut();
+            let no_read = D3D12_RANGE { Begin: 0, End: 0 };
+            res.Map(0, Some(&no_read), Some(&mut ptr)).ok()?;
+            Some((res, ptr.cast()))
+        }
+    }
+
+    fn completed(&self) -> u64 {
+        // SAFETY: plain fence query.
+        unsafe { self.fence.GetCompletedValue() }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn layout_is_d3d12_aligned() {
+    fn layout_is_copy_aligned() {
         let l = SlotLayout::for_mode(PixelFormat::Nv12, 1920, 1080);
         assert_eq!(l.plane_count, 2);
         assert_eq!(l.planes[0].pitch % 256, 0);

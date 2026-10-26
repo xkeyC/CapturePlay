@@ -12,38 +12,7 @@ use windows::Win32::Graphics::Dxgi::*;
 use windows::Win32::UI::WindowsAndMessaging::GetWindowRect;
 use windows::core::Interface;
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct DisplayInfo {
-    /// GDI device name (`\\.\DISPLAY1`).
-    pub device_name: String,
-    /// Windows HDR ("Use HDR") is on for this display.
-    pub hdr: bool,
-    pub max_nits: f32,
-    pub min_nits: f32,
-    pub max_full_frame_nits: f32,
-    /// Windows "SDR content brightness" in nits.
-    pub sdr_white_nits: f32,
-    pub refresh_hz: f64,
-}
-
-impl DisplayInfo {
-    /// Conservative SDR fallback.
-    pub fn fallback() -> Self {
-        Self {
-            device_name: String::new(),
-            hdr: false,
-            max_nits: 80.0,
-            min_nits: 0.0,
-            max_full_frame_nits: 80.0,
-            sdr_white_nits: 80.0,
-            refresh_hz: 60.0,
-        }
-    }
-
-    pub fn refresh_period_ns(&self) -> i64 {
-        (1e9 / self.refresh_hz.max(1.0)) as i64
-    }
-}
+use crate::display_info::DisplayInfo;
 
 fn intersect_area(a: &RECT, b: &RECT) -> i64 {
     let w = (a.right.min(b.right) - a.left.max(b.left)).max(0);

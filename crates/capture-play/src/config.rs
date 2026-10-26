@@ -4,12 +4,29 @@ use std::path::PathBuf;
 
 use cp_core::settings::Settings;
 
-/// `%APPDATA%\CapturePlay` (created on demand).
+/// `%APPDATA%\CapturePlay` on Windows, `$XDG_CONFIG_HOME/CapturePlay`
+/// (default `~/.config/CapturePlay`) elsewhere; created on demand.
 pub fn data_dir() -> PathBuf {
-    let base = std::env::var_os("APPDATA").map_or_else(|| PathBuf::from("."), PathBuf::from);
-    let dir = base.join("CapturePlay");
+    let dir = config_base().join("CapturePlay");
     let _ = std::fs::create_dir_all(&dir);
     dir
+}
+
+#[cfg(windows)]
+fn config_base() -> PathBuf {
+    std::env::var_os("APPDATA").map_or_else(|| PathBuf::from("."), PathBuf::from)
+}
+
+#[cfg(not(windows))]
+fn config_base() -> PathBuf {
+    let non_empty = |v: &str| {
+        std::env::var_os(v)
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+    };
+    non_empty("XDG_CONFIG_HOME")
+        .or_else(|| non_empty("HOME").map(|h| h.join(".config")))
+        .unwrap_or_else(|| PathBuf::from("."))
 }
 
 fn settings_path() -> PathBuf {

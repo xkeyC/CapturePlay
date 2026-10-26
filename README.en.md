@@ -1,7 +1,7 @@
 # CapturePlay
 
 Low-latency capture-card player: **PS5 / console → HDMI capture card → PC → real-time frame interpolation → native HDR output**.
-Rust + Direct3D 12, single process, single swapchain, Windows 10/11.
+Rust + Direct3D 12 (Windows 10/11) / Vulkan (Linux, port in progress), single process, single swapchain.
 
 [简体中文](README.md) | **English**
 
@@ -95,6 +95,16 @@ Optional components go into `runtime/` (git-ignored):
 - `runtime/nvidia-nr/`: community `nvngx_dlssnr.dll` and `captureplay_nvngx.dll`.
 
 `cargo build` also produces `captureplay_nvngx.dll`. The first time VSR/NR is enabled, model creation takes about 2–3 seconds; frames pass through meanwhile.
+
+**Linux (port in progress)**: V4L2 capture + Vulkan rendering + Wayland color management (tested on KDE Plasma 6). Requirements: Rust 1.95+, `dxc` (HLSL → SPIR-V; override with `DXC_PATH`), a Vulkan 1.3 GPU. On NixOS, `flake.nix` provides the development shell (dxc, runtime libraries, validation layers):
+
+~~~sh
+nix develop
+cargo build --release
+./target/release/capture-play
+~~~
+
+Status: capture, color conversion, HDR output (scRGB, mapped through the compositor's reference luminance) and the UI work; interpolation (VFG), upscaling (VSR), audio passthrough and present-timing feedback are not ported yet, NR is not supported. Settings live in `$XDG_CONFIG_HOME/CapturePlay/` (default `~/.config/CapturePlay/`); `CAPTUREPLAY_VK_DEBUG=1` enables the Vulkan validation layer.
 
 ### 1.7 Notes
 

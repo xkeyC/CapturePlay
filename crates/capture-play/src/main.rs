@@ -2,8 +2,10 @@
 //!
 //! Threads:
 //! * **main** – winit event loop only (window messages, input, fullscreen).
-//! * **render** – D3D12, pacing, egui UI, owns the capture session.
-//! * **capture** – Media Foundation reader (one copy into GPU upload heap).
+//! * **render** – D3D12 (Windows) / Vulkan (Linux), pacing, egui UI, owns the
+//!   capture session.
+//! * **capture** – Media Foundation (Windows) / V4L2 (Linux) reader (one copy
+//!   into GPU upload memory).
 
 #![windows_subsystem = "windows"]
 

@@ -11,6 +11,10 @@
 //! This is an unofficial, unsupported compatibility path for community
 //! runtimes; see README 6.4. Nothing here is used unless the user explicitly
 //! selects the community NR backend.
+//!
+//! Windows only: on other targets this crate is empty.
+
+#![cfg(windows)]
 
 use std::ffi::c_void;
 use std::sync::Mutex;

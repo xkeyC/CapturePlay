@@ -5,7 +5,7 @@ use std::mem::ManuallyDrop;
 use std::rc::Rc;
 
 use egui::epaint::{ImageDelta, Primitive, Vertex};
-use egui::{ClippedPrimitive, ImageData, TextureId, TexturesDelta};
+use egui::{ImageData, TextureId};
 use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
 use windows::Win32::Graphics::Direct3D12::*;
@@ -13,6 +13,7 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::core::{Result, s};
 
 use crate::arena::UploadArena;
+use crate::common::EguiFrame;
 use crate::descriptors::{GpuDescriptorRing, StagingHeap};
 use crate::gpu::{Gpu, borrow_com, shader_bytecode};
 use crate::presenter::BACKBUFFER_FORMAT;
@@ -39,16 +40,6 @@ impl std::fmt::Debug for EguiPass {
             .field("textures", &self.textures.len())
             .finish()
     }
-}
-
-/// Everything needed to draw one egui frame.
-#[derive(Debug, Clone, Copy)]
-pub struct EguiFrame<'a> {
-    pub primitives: &'a [ClippedPrimitive],
-    pub textures_delta: &'a TexturesDelta,
-    pub pixels_per_point: f32,
-    /// UI white in output units (scRGB on HDR displays, 1.0 on SDR).
-    pub white_scale: f32,
 }
 
 impl EguiPass {

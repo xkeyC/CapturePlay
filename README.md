@@ -1,7 +1,7 @@
 # CapturePlay
 
 低延迟采集卡播放器：**PS5 / 游戏机 → HDMI 采集卡 → PC → 实时补帧 → 原生 HDR 输出**。
-Rust + Direct3D 12，单进程、单交换链，Windows 10/11。
+Rust + Direct3D 12（Windows 10/11）/ Vulkan（Linux，移植中），单进程、单交换链。
 
 **简体中文** | [English](README.en.md)
 
@@ -95,6 +95,16 @@ cargo build --release
 - `runtime/nvidia-nr/`：社区 `nvngx_dlssnr.dll` 与 `captureplay_nvngx.dll`。
 
 `cargo build` 会同时生成 `captureplay_nvngx.dll`。首次启用 VSR/NR 时模型创建约 2–3 秒，期间画面直通。
+
+**Linux（移植中）**：V4L2 采集 + Vulkan 渲染 + Wayland 色彩管理（KDE Plasma 6 已测试）。需求：Rust 1.95+、`dxc`（HLSL → SPIR-V，`DXC_PATH` 可指定）、Vulkan 1.3 显卡。NixOS 上 `flake.nix` 提供开发环境（dxc、运行时库、验证层）：
+
+~~~sh
+nix develop
+cargo build --release
+./target/release/capture-play
+~~~
+
+当前状态：采集、色彩转换、HDR 输出（scRGB，按 compositor 的参考亮度换算）、UI 可用；补帧（VFG）、超分（VSR）、音频直通、呈现时序反馈尚未移植，NR 不支持。设置位于 `$XDG_CONFIG_HOME/CapturePlay/`（默认 `~/.config/CapturePlay/`），`CAPTUREPLAY_VK_DEBUG=1` 启用 Vulkan 验证层。
 
 ### 1.7 注意事项
 
