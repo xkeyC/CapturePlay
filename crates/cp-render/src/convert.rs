@@ -2,35 +2,18 @@
 
 use std::rc::Rc;
 
-use cp_core::color::{TransferFunction, yuv_to_rgb_matrix};
-use cp_core::{ColorDesc, PixelFormat, Primaries, VideoMode};
+use cp_core::{ColorDesc, PixelFormat, VideoMode};
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::core::Result;
 
 use crate::common::DecodeParams;
+use crate::constants::ConvertConstants;
 use crate::descriptors::{GpuDescriptorRing, StagingHeap};
 use crate::gpu::{Gpu, borrow_com};
 use crate::shaders::{self, ComputePipeline, dispatch_2d, set_compute_constants};
 use crate::texture::{Texture, TextureDesc, flush_barriers};
 use crate::upload::SlotLayout;
-
-/// Root constants of `convert.hlsl` (24 dwords).
-#[repr(C)]
-#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-struct Constants {
-    rows: [[f32; 4]; 3],
-    transfer: u32,
-    primaries_2020: u32,
-    sdr_white: f32,
-    hlg_peak: f32,
-    hlg_gamma: f32,
-    width: u32,
-    height: u32,
-    hdr_scale: f32,
-    chroma_texel: [f32; 2],
-    pad1: [f32; 2],
-}
 
 struct PlaneTextures {
     mode: VideoMode,
@@ -171,30 +154,7 @@ impl ConvertPass {
         let srv_table = ring.table(&gpu.device, &srvs);
         let uav_table = ring.table(&gpu.device, &[out.uav_handle()]);
         let chroma = inputs.planes.get(1).unwrap_or(&inputs.planes[0]);
-        let c = Constants {
-            rows: yuv_to_rgb_matrix(
-                color.matrix,
-                color.range,
-                mode.format.bit_depth(),
-                mode.format.storage_bits(),
-            ),
-            transfer: match color.transfer {
-                TransferFunction::Srgb => 0,
-                TransferFunction::Gamma22 => 1,
-                TransferFunction::Bt1886 => 2,
-                TransferFunction::Pq => 3,
-                TransferFunction::Hlg => 4,
-            },
-            primaries_2020: u32::from(color.primaries == Primaries::Bt2020),
-            sdr_white: params.sdr_white_nits / cp_core::color::SCRGB_UNIT_NITS,
-            hlg_peak: params.hlg_peak_nits,
-            hlg_gamma: 1.2 + 0.42 * (params.hlg_peak_nits / 1000.0).log10(),
-            width: mode.width,
-            height: mode.height,
-            hdr_scale: params.hdr_scale,
-            chroma_texel: [1.0 / chroma.width as f32, 1.0 / chroma.height as f32],
-            pad1: [0.0; 2],
-        };
+        let c = ConvertConstants::new(mode, color, params, (chroma.width, chroma.height));
         set_compute_constants(list, &c);
         // SAFETY: tables live in the bound shader-visible heap.
         unsafe {

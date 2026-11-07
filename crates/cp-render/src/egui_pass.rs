@@ -14,19 +14,12 @@ use windows::core::{Result, s};
 
 use crate::arena::UploadArena;
 use crate::common::EguiFrame;
+use crate::constants::EguiConstants;
 use crate::descriptors::{GpuDescriptorRing, StagingHeap};
 use crate::gpu::{Gpu, borrow_com, shader_bytecode};
 use crate::presenter::BACKBUFFER_FORMAT;
 use crate::shaders::{self, set_graphics_constants};
 use crate::texture::{Texture, TextureDesc, flush_barriers};
-
-#[repr(C)]
-#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-struct Constants {
-    screen_size_points: [f32; 2],
-    white_scale: f32,
-    pad: f32,
-}
 
 pub struct EguiPass {
     root: ID3D12RootSignature,
@@ -208,11 +201,7 @@ impl EguiPass {
             return Ok(());
         }
         let ppp = frame.pixels_per_point;
-        let c = Constants {
-            screen_size_points: [size_px.0 as f32 / ppp, size_px.1 as f32 / ppp],
-            white_scale: frame.white_scale,
-            pad: 0.0,
-        };
+        let c = EguiConstants::new(size_px, ppp, frame.white_scale);
         // SAFETY: valid pipeline and render target.
         unsafe {
             list.OMSetRenderTargets(1, Some(&rtv), false, None);

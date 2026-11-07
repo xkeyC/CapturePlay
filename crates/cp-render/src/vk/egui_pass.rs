@@ -15,14 +15,7 @@ use super::device::Gpu;
 use super::pipeline::{self, Layouts, Pipeline};
 use super::texture::{Texture, barrier};
 use crate::common::EguiFrame;
-
-#[repr(C)]
-#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-struct Constants {
-    screen_size_points: [f32; 2],
-    white_scale: f32,
-    pad: f32,
-}
+use crate::constants::EguiConstants;
 
 pub struct EguiPass {
     pipeline: Pipeline,
@@ -185,11 +178,7 @@ impl EguiPass {
         }
         let d = &gpu.device;
         let ppp = frame.pixels_per_point;
-        let c = Constants {
-            screen_size_points: [size_px.0 as f32 / ppp, size_px.1 as f32 / ppp],
-            white_scale: frame.white_scale,
-            pad: 0.0,
-        };
+        let c = EguiConstants::new(size_px, ppp, frame.white_scale);
         let Some(cbuf) = arena.constants(&c, gpu.min_uniform_alignment) else {
             return Err(super::VkError::Other("frame arena exhausted".into()));
         };

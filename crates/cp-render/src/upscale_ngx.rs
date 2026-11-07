@@ -21,9 +21,9 @@ use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R10G10B10A2_UNORM;
 use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
 use windows::core::Result;
 
+use crate::constants::PackConstants;
 use crate::descriptors::StagingHeap;
 use crate::gpu::Gpu;
-use crate::interp_vfg::Constants;
 use crate::renderer::{RecordCtx, Upscaler};
 use crate::shaders::{self, ComputePipeline, dispatch_2d, set_compute_constants};
 use crate::texture::{Texture, TextureDesc, flush_barriers};
@@ -256,7 +256,7 @@ impl Upscaler for NgxVsrUpscaler {
             ));
         }
         let device = &ctx.gpu.device;
-        let constants = |w: u32, h: u32| Constants {
+        let constants = |w: u32, h: u32| PackConstants {
             width: w,
             height: h,
             hdr: 1,
