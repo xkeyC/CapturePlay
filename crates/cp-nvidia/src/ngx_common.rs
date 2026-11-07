@@ -19,39 +19,9 @@ pub struct NrOptions {
     pub preset: u32,
 }
 
-/// Live model tuning. These keys are read at evaluation time, so changing
-/// them does not recreate the feature (the model preset does).
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct NrTuning {
-    /// DLSSNR.Style: 0 default, 1 natural, 2 cinematic.
-    pub style: u32,
-    /// DLSSNR.Intensity: overall strength of the model's edit.
-    pub intensity: f32,
-    /// DLSSNR.LocalStructureStrength.
-    pub local_structure: f32,
-    /// DLSSNR.LocalToneStrength.
-    pub local_tone: f32,
-    /// DLSSNR.SkinStructureStrength.
-    pub skin_structure: f32,
-    /// DLSSNR.UseAutoMask.
-    pub auto_mask: bool,
-    /// DLSSNR.UICorrection.
-    pub ui_correction: bool,
-}
-
-impl Default for NrTuning {
-    fn default() -> Self {
-        Self {
-            style: 0,
-            intensity: 1.0,
-            local_structure: 1.0,
-            local_tone: 1.0,
-            skin_structure: 0.0,
-            auto_mask: false,
-            ui_correction: false,
-        }
-    }
-}
+/// Live model tuning (the DLSSNR parameter list is shared with the Proton
+/// host, see `nr_proto::dlssnr`).
+pub use nr_proto::dlssnr::Tuning as NrTuning;
 
 #[derive(Debug, thiserror::Error)]
 pub enum NgxError {

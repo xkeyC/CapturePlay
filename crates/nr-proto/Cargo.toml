@@ -1,6 +1,6 @@
 [package]
 name = "nr-proto"
-description = "Shared-memory protocol between CapturePlay and captureplay-nr-host"
+description = "DLSS NR contracts: the CapturePlay ↔ captureplay-nr-host shared memory and the DLSSNR parameters"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
