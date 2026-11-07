@@ -15,24 +15,12 @@ use windows::Win32::Foundation::{E_FAIL, E_NOTIMPL};
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::Result;
 
+use crate::constants::PackConstants;
 use crate::descriptors::{CpuDescriptor, StagingHeap, raw_buffer_view};
 use crate::gpu::{Gpu, transition};
 use crate::renderer::{FrameInput, Interpolator, RecordCtx};
 use crate::shaders::{self, ComputePipeline, dispatch_2d, set_compute_constants};
 use crate::texture::{Texture, flush_barriers};
-
-/// Root constants of `vfg.hlsl` (also used by the VSR upscaler).
-#[repr(C)]
-#[derive(Debug, Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-pub(crate) struct Constants {
-    pub width: u32,
-    pub height: u32,
-    pub pitch: u32,
-    /// 1 = PQ / BT.2020 encoding, 0 = sRGB relative to `sdr_white`.
-    pub hdr: u32,
-    pub sdr_white: f32,
-    pub pad: [f32; 3],
-}
 
 fn vfg_err(e: VfxError) -> windows::core::Error {
     windows::core::Error::new(E_FAIL, e.to_string())
@@ -133,8 +121,8 @@ impl VfgInterpolator {
         Ok(())
     }
 
-    fn constants(&self, res: &Resources) -> Constants {
-        Constants {
+    fn constants(&self, res: &Resources) -> PackConstants {
+        PackConstants {
             width: res.session.width,
             height: res.session.height,
             pitch: res.session.pitch,

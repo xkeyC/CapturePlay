@@ -8,27 +8,13 @@ use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::core::Result;
 
-use crate::common::{OutputParams, letterbox};
+use crate::common::OutputParams;
+use crate::constants::OutputConstants;
 use crate::descriptors::GpuDescriptorRing;
 use crate::gpu::{Gpu, shader_bytecode};
 use crate::presenter::BACKBUFFER_FORMAT;
 use crate::shaders::{self, set_graphics_constants};
 use crate::texture::{Texture, flush_barriers};
-
-#[repr(C)]
-#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-struct Constants {
-    uv_scale: [f32; 2],
-    uv_offset: [f32; 2],
-    src_size: [f32; 2],
-    inv_src_size: [f32; 2],
-    sdr_display: u32,
-    target_peak: f32,
-    src_peak: f32,
-    out_scale: f32,
-    catmull_rom: u32,
-    pad: [f32; 3],
-}
 
 pub struct OutputPass {
     root: ID3D12RootSignature,
@@ -115,26 +101,7 @@ impl OutputPass {
         src.transition(&mut barriers, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
         flush_barriers(list, &mut barriers);
 
-        let (x, y, w, h) = letterbox((src.width, src.height), size);
-        let (target_peak, out_scale) = if p.display_hdr {
-            (p.display_peak_nits, 1.0 / cp_core::color::SCRGB_UNIT_NITS)
-        } else {
-            (p.sdr_white_nits, 1.0 / p.sdr_white_nits)
-        };
-        let c = Constants {
-            uv_scale: [1.0 / w, 1.0 / h],
-            uv_offset: [-x / w, -y / h],
-            src_size: [src.width as f32, src.height as f32],
-            inv_src_size: [1.0 / src.width as f32, 1.0 / src.height as f32],
-            sdr_display: u32::from(!p.display_hdr),
-            target_peak,
-            src_peak: p.content_peak_nits,
-            out_scale,
-            catmull_rom: u32::from(
-                p.catmull_rom && (w as u32 != src.width || h as u32 != src.height),
-            ),
-            pad: [0.0; 3],
-        };
+        let c = OutputConstants::new((src.width, src.height), size, p);
         let table = ring.table(&gpu.device, &[src.srv.handle]);
         // SAFETY: valid pipeline objects and descriptor table.
         unsafe {

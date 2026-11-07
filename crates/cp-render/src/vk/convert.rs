@@ -1,8 +1,7 @@
 //! Upload slot → plane textures → linear scRGB working frame.
 
 use ash::vk;
-use cp_core::color::{TransferFunction, yuv_to_rgb_matrix};
-use cp_core::{ColorDesc, PixelFormat, Primaries, VideoMode};
+use cp_core::{ColorDesc, PixelFormat, VideoMode};
 
 use super::Result;
 use super::arena::Arena;
@@ -10,24 +9,8 @@ use super::device::Gpu;
 use super::pipeline::{self, Layouts, Pipeline};
 use super::texture::{Buffer, Texture, barrier};
 use crate::common::DecodeParams;
+use crate::constants::ConvertConstants;
 use crate::upload::SlotLayout;
-
-/// Constants of `convert.hlsl` (D3D cbuffer layout, 24 dwords).
-#[repr(C)]
-#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-struct Constants {
-    rows: [[f32; 4]; 3],
-    transfer: u32,
-    primaries_2020: u32,
-    sdr_white: f32,
-    hlg_peak: f32,
-    hlg_gamma: f32,
-    width: u32,
-    height: u32,
-    hdr_scale: f32,
-    chroma_texel: [f32; 2],
-    pad1: [f32; 2],
-}
 
 struct PlaneTextures {
     mode: VideoMode,
@@ -169,30 +152,7 @@ impl ConvertPass {
             PixelFormat::Bgra8 => &self.bgra,
         };
         let chroma = inputs.planes.get(1).unwrap_or(&inputs.planes[0]);
-        let c = Constants {
-            rows: yuv_to_rgb_matrix(
-                color.matrix,
-                color.range,
-                mode.format.bit_depth(),
-                mode.format.storage_bits(),
-            ),
-            transfer: match color.transfer {
-                TransferFunction::Srgb => 0,
-                TransferFunction::Gamma22 => 1,
-                TransferFunction::Bt1886 => 2,
-                TransferFunction::Pq => 3,
-                TransferFunction::Hlg => 4,
-            },
-            primaries_2020: u32::from(color.primaries == Primaries::Bt2020),
-            sdr_white: params.sdr_white_nits / cp_core::color::SCRGB_UNIT_NITS,
-            hlg_peak: params.hlg_peak_nits,
-            hlg_gamma: 1.2 + 0.42 * (params.hlg_peak_nits / 1000.0).log10(),
-            width: mode.width,
-            height: mode.height,
-            hdr_scale: params.hdr_scale,
-            chroma_texel: [1.0 / chroma.width as f32, 1.0 / chroma.height as f32],
-            pad1: [0.0; 2],
-        };
+        let c = ConvertConstants::new(mode, color, params, (chroma.width, chroma.height));
         let Some(cbuf) = arena.constants(&c, gpu.min_uniform_alignment) else {
             return Err(super::VkError::Other("frame arena exhausted".into()));
         };

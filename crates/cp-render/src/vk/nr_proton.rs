@@ -36,6 +36,7 @@ use super::pipeline::{self, Pipeline};
 use super::renderer::{Enhancer, FrameInput, RecordCtx};
 use super::texture::{Texture, WORKING_USAGE, barrier, external_barrier};
 use super::{Result, VkError};
+use crate::constants::{NrCompositeConstants, NrEncodeConstants};
 
 /// Answer time after which a frame counts as lost.
 const STALL: Duration = Duration::from_secs(2);
@@ -56,27 +57,6 @@ pub struct ProtonNrConfig {
     pub snippet: PathBuf,
     /// `DLSSNR.Hint.Render.Preset`.
     pub preset: u32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-struct EncodeConstants {
-    width: u32,
-    height: u32,
-    hdr: u32,
-    sdr_white: f32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-struct CompositeConstants {
-    width: u32,
-    height: u32,
-    hdr: u32,
-    sdr_white: f32,
-    detail: f32,
-    colour: f32,
-    _pad: [f32; 2],
 }
 
 /// The shared-memory file, mapped.
@@ -851,7 +831,7 @@ impl Enhancer for ProtonNrEnhancer {
         // 1. Working frame → display-referred sRGB proxy, handed to the host.
         external_barrier(d, ctx.cmd(), family, s.proxy.image, true);
         barrier(d, ctx.cmd());
-        let encode = EncodeConstants {
+        let encode = NrEncodeConstants {
             width: size.0,
             height: size.1,
             hdr: u32::from(self.hdr),
@@ -878,7 +858,7 @@ impl Enhancer for ProtonNrEnhancer {
         // 3. Bounded residual composite over the untouched linear frame.
         external_barrier(d, ctx.cmd(), family, s.edited.image, true);
         barrier(d, ctx.cmd());
-        let composite = CompositeConstants {
+        let composite = NrCompositeConstants {
             width: size.0,
             height: size.1,
             hdr: u32::from(self.hdr),

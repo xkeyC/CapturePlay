@@ -20,19 +20,7 @@ use super::pipeline::{self, ComputeLayout, Pipeline};
 use super::renderer::{FrameInput, Interpolator, RecordCtx};
 use super::texture::{Texture, barrier};
 use super::{Result, VkError};
-
-/// Constants of `vfg.hlsl` (D3D cbuffer layout, 8 dwords).
-#[repr(C)]
-#[derive(Debug, Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct Constants {
-    width: u32,
-    height: u32,
-    pitch: u32,
-    /// 1 = PQ / BT.2020 encoding, 0 = sRGB relative to `sdr_white`.
-    hdr: u32,
-    sdr_white: f32,
-    pad: [f32; 3],
-}
+use crate::constants::PackConstants;
 
 fn vfx_err(e: cp_nvidia::vfx::VfxError) -> VkError {
     VkError::Other(e.to_string())
@@ -301,8 +289,8 @@ impl VfgInterpolator {
         Ok(())
     }
 
-    fn constants(&self, res: &Resources) -> Constants {
-        Constants {
+    fn constants(&self, res: &Resources) -> PackConstants {
+        PackConstants {
             width: res.session.width,
             height: res.session.height,
             pitch: res.session.pitch,
@@ -317,7 +305,7 @@ impl VfgInterpolator {
         ctx: &mut RecordCtx<'_>,
         p: &Pipeline,
         layout: &ComputeLayout,
-        c: &Constants,
+        c: &PackConstants,
         writes: &[vk::WriteDescriptorSet<'_>],
     ) -> Result<()> {
         let cbuf = ctx

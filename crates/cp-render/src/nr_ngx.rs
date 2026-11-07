@@ -29,6 +29,7 @@ use windows::Win32::Graphics::Dxgi::Common::{
 use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
 use windows::core::{Interface, Result};
 
+use crate::constants::{NrCompositeConstants, NrEncodeConstants, NrFillConstants};
 use crate::descriptors::StagingHeap;
 use crate::gpu::Gpu;
 use crate::renderer::{Enhancer, FrameInput, RecordCtx};
@@ -36,36 +37,6 @@ use crate::shaders::{self, ComputePipeline, dispatch_2d, set_compute_constants};
 use crate::texture::{Texture, TextureDesc, flush_barriers};
 
 type Size = (u32, u32);
-
-#[repr(C)]
-#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-struct EncodeConstants {
-    width: u32,
-    height: u32,
-    hdr: u32,
-    sdr_white: f32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-struct CompositeConstants {
-    width: u32,
-    height: u32,
-    hdr: u32,
-    sdr_white: f32,
-    detail: f32,
-    colour: f32,
-    _pad: [f32; 2],
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-struct FillConstants {
-    width: u32,
-    height: u32,
-    value: f32,
-    _pad: u32,
-}
 
 /// The created feature, handed from the loader thread.
 struct Loaded(NrFeature);
@@ -366,7 +337,7 @@ impl Enhancer for NgxNrEnhancer {
                 .transition(&mut b, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
             flush_barriers(ctx.list, &mut b);
             self.fill_depth.bind(ctx.list);
-            let fill = FillConstants {
+            let fill = NrFillConstants {
                 width: size.0,
                 height: size.1,
                 value: 0.5,
@@ -396,7 +367,7 @@ impl Enhancer for NgxNrEnhancer {
         self.encode.bind(ctx.list);
         set_compute_constants(
             ctx.list,
-            &EncodeConstants {
+            &NrEncodeConstants {
                 width: size.0,
                 height: size.1,
                 hdr: u32::from(self.hdr),
@@ -449,7 +420,7 @@ impl Enhancer for NgxNrEnhancer {
         self.composite.bind(ctx.list);
         set_compute_constants(
             ctx.list,
-            &CompositeConstants {
+            &NrCompositeConstants {
                 width: size.0,
                 height: size.1,
                 hdr: u32::from(self.hdr),
@@ -519,7 +490,7 @@ mod tests {
             encode.bind(&h.list);
             set_compute_constants(
                 &h.list,
-                &EncodeConstants {
+                &NrEncodeConstants {
                     width: w,
                     height: ht,
                     hdr,
@@ -552,7 +523,7 @@ mod tests {
             composite.bind(&h.list);
             set_compute_constants(
                 &h.list,
-                &CompositeConstants {
+                &NrCompositeConstants {
                     width: w,
                     height: ht,
                     hdr,

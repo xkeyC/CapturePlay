@@ -19,23 +19,11 @@ use super::pipeline::{self, Pipeline};
 use super::renderer::{RecordCtx, Upscaler};
 use super::texture::{Texture, barrier};
 use super::{Result, VkError};
+use crate::constants::PackConstants;
 
 type Size = (u32, u32);
 
 const SURFACE_FORMAT: vk::Format = vk::Format::A2B10G10R10_UNORM_PACK32;
-
-/// Constants of `vfg.hlsl` (D3D cbuffer layout, 8 dwords).
-#[repr(C)]
-#[derive(Debug, Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct Constants {
-    width: u32,
-    height: u32,
-    pitch: u32,
-    /// 1 = PQ / BT.2020 encoding, 0 = sRGB relative to `sdr_white`.
-    hdr: u32,
-    sdr_white: f32,
-    pad: [f32; 3],
-}
 
 /// The created feature and the recorded creation work, handed from the
 /// loader thread.
@@ -300,7 +288,7 @@ impl Upscaler for NgxVsrUpscaler {
             return Err(VkError::Other("RTX VSR surfaces".into()));
         };
         let d = &ctx.gpu.device;
-        let constants = |w: u32, h: u32| Constants {
+        let constants = |w: u32, h: u32| PackConstants {
             width: w,
             height: h,
             hdr: 1,
