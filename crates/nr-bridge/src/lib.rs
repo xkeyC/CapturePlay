@@ -5,8 +5,9 @@
 //! otherwise. Community builds keep that check, so they cannot be driven from
 //! an application executable directly. This DLL is CapturePlay's own code (it
 //! contains no NVIDIA code): its file name contains the accepted string and it
-//! forwards the NGX D3D12 entry points to the snippet loaded into this module,
-//! which makes the snippet see an accepted caller.
+//! forwards the NGX D3D12 entry points ([`vulkan`]: the Vulkan ones) to the
+//! snippet loaded into this module, which makes the snippet see an accepted
+//! caller.
 //!
 //! This is an unofficial, unsupported compatibility path for community
 //! runtimes; see README 6.4. Nothing here is used unless the user explicitly
@@ -24,6 +25,8 @@ use windows::Win32::System::LibraryLoader::{
     GetProcAddress, LOAD_WITH_ALTERED_SEARCH_PATH, LoadLibraryExW,
 };
 use windows::core::{PCSTR, PCWSTR, s};
+
+pub mod vulkan;
 
 type InitExt = unsafe extern "system" fn(u64, *const u16, *mut c_void, u32, *const c_void) -> i32;
 type Create = unsafe extern "system" fn(*mut c_void, i32, *const c_void, *mut *mut c_void) -> i32;
