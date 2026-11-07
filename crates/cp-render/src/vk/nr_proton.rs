@@ -40,6 +40,9 @@ use crate::constants::{NrCompositeConstants, NrEncodeConstants};
 
 /// Answer time after which a frame counts as lost.
 const STALL: Duration = Duration::from_secs(2);
+/// The host's log, in the Wine prefix (the host may be installed read-only).
+const HOST_LOG: &str = "captureplay-nr-host.log";
+
 /// Time the host may take to start (Proton, prefix, NGX init).
 const START_TIMEOUT: Duration = Duration::from_secs(90);
 
@@ -195,6 +198,8 @@ impl Host {
             .arg("--snippet")
             .arg(nr_proto::wine_path(&cfg.snippet))
             .args(["--parent", &std::process::id().to_string()])
+            .arg("--log")
+            .arg(nr_proto::wine_path(&cfg.prefix.join(HOST_LOG)))
             .args(["--token", &token])
             .env("STEAM_COMPAT_DATA_PATH", &cfg.prefix)
             .env("STEAM_COMPAT_CLIENT_INSTALL_PATH", steam)
@@ -606,7 +611,10 @@ impl ProtonNrEnhancer {
             }
             HostState::Starting => {
                 if host.started.elapsed() > START_TIMEOUT {
-                    self.give_up("the host did not start (see captureplay-nr-host.log)");
+                    self.give_up(&format!(
+                        "the host did not start (see {})",
+                        self.cfg.prefix.join(HOST_LOG).display()
+                    ));
                 } else if host
                     .process
                     .as_ref()
