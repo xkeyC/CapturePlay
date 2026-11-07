@@ -8,7 +8,11 @@
     { nixpkgs, ... }:
     let
       system = "x86_64-linux";
-      pkgs = nixpkgs.legacyPackages.${system};
+      pkgs = import nixpkgs {
+        inherit system;
+        # nvidia-vfx-runtime (an NVIDIA wheel) is unfree.
+        config.allowUnfree = true;
+      };
       # NVIDIA's static NGX loader for Linux (DLSS SDK, NVIDIA RTX SDKs
       # License; never part of this repository): enables VSR on Vulkan.
       ngxRev = "374959484e79a640feaba44c93ac8cfb0a03f5b5";
@@ -36,6 +40,26 @@
       ];
     in
     {
+      # Install with `nixosModules.default` (programs.capture-play) or the
+      # packages; nvidia-vfx-runtime is unfree.
+      packages.${system} = rec {
+        capture-play = pkgs.callPackage ./nix/package.nix { };
+        nvidia-vfx-runtime = pkgs.callPackage ./nix/nvidia-vfx.nix { };
+        nr-host = pkgs.pkgsCross.mingwW64.callPackage ./nix/nr-host.nix { };
+        # Everything NVIDIA wired in (needs allowUnfree for the runtime).
+        capture-play-full = capture-play.override {
+          vfxRuntime = nvidia-vfx-runtime;
+          nrHost = nr-host;
+        };
+        default = capture-play;
+      };
+
+      overlays.default = final: _: {
+        capture-play = final.callPackage ./nix/package.nix { };
+      };
+
+      nixosModules.default = import ./nix/module.nix;
+
       # The Rust toolchain comes from rustup (rust-version in Cargo.toml).
       devShells.${system}.default = pkgs.mkShell {
         packages = with pkgs; [

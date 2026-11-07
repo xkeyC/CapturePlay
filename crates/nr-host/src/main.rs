@@ -10,7 +10,8 @@
 //! Experimental and unsupported, like the community NR path on Windows.
 //!
 //! A GUI-subsystem program: Wine would open a console window for a console
-//! one. Output goes to `captureplay-nr-host.log` beside the executable.
+//! one. Output goes to the `--log` file (default: `captureplay-nr-host.log`
+//! beside the executable).
 
 #![cfg_attr(windows, windows_subsystem = "windows")]
 

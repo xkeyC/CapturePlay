@@ -4,8 +4,9 @@
 //!   extensions, snippet init, feature creation, one evaluated frame and the
 //!   export of its output as a Linux file descriptor.
 
-/// Writes a line to stderr and to `captureplay-nr-host.log` beside the
-/// executable (Proton does not always pass a console program's stderr on).
+/// Writes a line to stderr and to the log file: `--log`, else
+/// `captureplay-nr-host.log` beside the executable (Proton does not pass a
+/// program's stderr on; installed read-only, the client names a file).
 macro_rules! log {
     ($($arg:tt)*) => {
         $crate::host::log_line(&format!($($arg)*))
@@ -18,6 +19,9 @@ mod params;
 mod serve;
 mod share;
 
+/// The `--log` file, set while parsing the arguments.
+static LOG_PATH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
 pub fn log_line(line: &str) {
     use std::io::Write as _;
     use std::sync::Mutex;
@@ -27,9 +31,12 @@ pub fn log_line(line: &str) {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     if f.is_none() {
-        *f = std::env::current_exe()
-            .ok()
-            .and_then(|p| std::fs::File::create(p.with_extension("log")).ok());
+        let path = LOG_PATH.get().cloned().or_else(|| {
+            std::env::current_exe()
+                .ok()
+                .map(|p| p.with_extension("log"))
+        });
+        *f = path.and_then(|p| std::fs::File::create(p).ok());
     }
     if let Some(f) = f.as_mut() {
         let _ = writeln!(f, "{line}");
@@ -94,6 +101,9 @@ fn parse() -> Result<Command> {
             "--parent" => parent = Some(v.parse().map_err(|_| "--parent PID")?),
             // Lets the native side find this process; otherwise unused.
             "--token" => {}
+            "--log" => {
+                let _ = LOG_PATH.set(v.into());
+            }
             _ => return Err(format!("unknown option {k}\n{USAGE}")),
         }
     }
