@@ -695,25 +695,38 @@ impl State {
         }
     }
 
-    /// (Re)creates the per-frame enhancement stage when its settings changed.
-    #[cfg(windows)]
+    /// (Re)creates the per-frame enhancement stage when its settings
+    /// changed; strength and model tuning are per-evaluate keys and do not
+    /// reload the model.
+    #[cfg(any(windows, target_os = "linux"))]
     fn apply_enhancer(&mut self) {
-        use cp_core::settings::EnhanceBackend;
         let want = self.settings.enhance.clone();
-        if let Some(prev) = self.enhance_backend.clone() {
+        if let Some(prev) = &self.enhance_backend {
             let same = prev.backend == want.backend
                 && prev.nr_preset == want.nr_preset
-                && prev.nr_runtime_dir == want.nr_runtime_dir;
+                && prev.nr_runtime_dir == want.nr_runtime_dir
+                && prev.nr_proton == want.nr_proton
+                && prev.nr_proton_prefix == want.nr_proton_prefix;
             if same {
-                // Strength and model tuning are per-evaluate keys; do not
-                // reload the model when only they change.
                 self.renderer.set_enhance_strength(want.nr_strength);
                 self.renderer.set_nr_tuning(nr_tuning(&want));
                 self.enhance_backend = Some(want);
                 return;
             }
         }
-        self.enhance_backend = Some(want.clone());
+        let enhancer = self.nr_enhancer(&want);
+        self.enhance_backend = Some(want);
+        self.renderer.set_enhancer(enhancer);
+    }
+
+    /// The DLSS NR stage for `want` on Windows: NGX feature 18 through the
+    /// driver, or a community snippet through `captureplay_nvngx.dll`.
+    #[cfg(windows)]
+    fn nr_enhancer(
+        &self,
+        want: &cp_core::settings::EnhanceSettings,
+    ) -> Option<Box<dyn cp_render::Enhancer>> {
+        use cp_core::settings::EnhanceBackend;
         let route = match want.backend {
             EnhanceBackend::Off => None,
             EnhanceBackend::NvidiaDlssNr => Some(cp_nvidia::ngx::NrRoute::Official),
@@ -735,7 +748,7 @@ impl State {
                 }
             }
         };
-        let enhancer: Option<Box<dyn cp_render::Enhancer>> = match route {
+        match route {
             None => None,
             Some(route) => match cp_render::NgxNrEnhancer::new(
                 self.renderer.gpu(),
@@ -745,7 +758,7 @@ impl State {
                     preset: want.nr_preset.code(),
                 },
                 route,
-                nr_tuning(&want),
+                nr_tuning(want),
                 cp_render::NrPost {
                     detail: want.nr_strength,
                     colour: 1.0,
@@ -757,32 +770,19 @@ impl State {
                     None
                 }
             },
-        };
-        self.renderer.set_enhancer(enhancer);
+        }
     }
 
-    /// (Re)creates the DLSS NR stage when its settings changed. Linux has
-    /// no NGX feature 18: both NR choices run NVIDIA's Windows model in the
-    /// Proton-hosted `captureplay-nr-host`.
+    /// The DLSS NR stage for `want` on Linux, which has no NGX feature 18:
+    /// both NR choices run NVIDIA's Windows model in the Proton-hosted
+    /// `captureplay-nr-host`.
     #[cfg(target_os = "linux")]
-    fn apply_enhancer(&mut self) {
+    fn nr_enhancer(
+        &self,
+        want: &cp_core::settings::EnhanceSettings,
+    ) -> Option<Box<dyn cp_render::Enhancer>> {
         use cp_core::settings::EnhanceBackend;
-        let want = self.settings.enhance.clone();
-        if let Some(prev) = self.enhance_backend.clone() {
-            let same = prev.backend == want.backend
-                && prev.nr_preset == want.nr_preset
-                && prev.nr_runtime_dir == want.nr_runtime_dir
-                && prev.nr_proton == want.nr_proton
-                && prev.nr_proton_prefix == want.nr_proton_prefix;
-            if same {
-                self.renderer.set_enhance_strength(want.nr_strength);
-                self.renderer.set_nr_tuning(nr_tuning(&want));
-                self.enhance_backend = Some(want);
-                return;
-            }
-        }
-        self.enhance_backend = Some(want.clone());
-        let enhancer: Option<Box<dyn cp_render::Enhancer>> = match want.backend {
+        match want.backend {
             EnhanceBackend::Off => None,
             EnhanceBackend::NvidiaDlssNr | EnhanceBackend::NvidiaDlssNrCommunity => {
                 match nr_proton_config(&self.settings).and_then(|cfg| {
@@ -790,7 +790,7 @@ impl State {
                         self.renderer.gpu(),
                         self.renderer.layouts(),
                         cfg,
-                        nr_tuning(&want),
+                        nr_tuning(want),
                         want.nr_strength,
                     )
                     .map_err(|e| e.to_string())
@@ -802,8 +802,7 @@ impl State {
                     }
                 }
             }
-        };
-        self.renderer.set_enhancer(enhancer);
+        }
     }
 
     /// DLSS NR has no backend on this platform; the setting is kept.
