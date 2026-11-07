@@ -31,3 +31,5 @@ pub mod vfx;
 #[cfg(target_os = "linux")]
 #[path = "vfx_linux.rs"]
 pub mod vfx;
+#[cfg(any(windows, target_os = "linux"))]
+mod vfx_common;
