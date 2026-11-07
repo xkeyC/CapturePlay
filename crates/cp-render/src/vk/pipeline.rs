@@ -34,6 +34,8 @@ pub const NGX_ENCODE: &[u8] = shader!("ngx_encode");
 pub const VFG_ENCODE: &[u8] = shader!("vfg_encode");
 pub const VFG_DECODE: &[u8] = shader!("vfg_decode");
 pub const NGX_DECODE: &[u8] = shader!("ngx_decode");
+pub const NR_ENCODE: &[u8] = shader!("nr_encode");
+pub const NR_COMPOSITE: &[u8] = shader!("nr_composite");
 
 pub const BINDING_SRV: u32 = 0;
 pub const BINDING_UAV: u32 = 8;

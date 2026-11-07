@@ -674,3 +674,122 @@ fn vfg_interpolates_through_cuda_interop() {
         );
     }
 }
+
+/// End to end through the Proton-hosted model:
+/// `cargo test -p cp-render nr_proton -- --ignored --nocapture`, with the
+/// host cross-built (`scripts/build-nr-host.sh`) and `nvngx_dlssnr.dll` at
+/// `$CAPTUREPLAY_NR_SNIPPET` (default: DLSS5VKLayer's import folder).
+#[test]
+#[ignore = "needs Proton, nvngx_dlssnr.dll and the cross-built captureplay-nr-host"]
+fn nr_proton_enhances_through_the_host() {
+    use super::nr_proton::{ProtonNrConfig, ProtonNrEnhancer, discover};
+    use super::renderer::{Enhancer, FrameInput, RecordCtx};
+    use std::path::PathBuf;
+
+    let Some(mut h) = Harness::new() else { return };
+    let home = PathBuf::from(std::env::var_os("HOME").expect("HOME"));
+    let snippet = std::env::var_os("CAPTUREPLAY_NR_SNIPPET").map_or_else(
+        || home.join(".local/share/dlssnr/binaries/nvngx_dlssnr.dll"),
+        PathBuf::from,
+    );
+    let host_exe = std::env::var_os("CAPTUREPLAY_NR_HOST").map_or_else(
+        || {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../target/x86_64-pc-windows-gnu/release/captureplay-nr-host.exe")
+        },
+        PathBuf::from,
+    );
+    let script = discover::proton_scripts()
+        .into_iter()
+        .next()
+        .expect("a Proton install in Steam");
+    let cfg = ProtonNrConfig {
+        proton: discover::proton_command(&script),
+        prefix: home.join(".local/share/CapturePlay/nr-prefix"),
+        host_exe,
+        snippet,
+        preset: 0,
+    };
+    eprintln!("NR config: {cfg:?}");
+    let mut nr =
+        ProtonNrEnhancer::new(&h.gpu, &h.layouts, cfg, cp_nvidia::NrTuning::default(), 1.0)
+            .expect("enhancer");
+    // Inputs span 0..1 scRGB: use that as SDR white.
+    nr.set_content(false, 1.0);
+
+    let (w, ht): (u32, u32) = std::env::var("CAPTUREPLAY_NR_SIZE")
+        .ok()
+        .and_then(|s| {
+            let (a, b) = s.split_once('x')?;
+            Some((a.parse().ok()?, b.parse().ok()?))
+        })
+        .unwrap_or((640, 360));
+    let input: Vec<[f32; 4]> = (0..ht)
+        .flat_map(|y| {
+            (0..w).map(move |x| {
+                let (u, v) = (x as f32 / w as f32, y as f32 / ht as f32);
+                let checker = if ((x / 32) + (y / 32)) % 2 == 0 {
+                    0.1
+                } else {
+                    0.0
+                };
+                [
+                    0.15 + 0.6 * u + checker,
+                    0.2 + 0.5 * v,
+                    0.7 - 0.4 * u + checker,
+                    1.0,
+                ]
+            })
+        })
+        .collect();
+    let start = std::time::Instant::now();
+    let mut processed = 0;
+    let mut id = 0;
+    while processed < 5 {
+        assert!(!nr.failed(), "DLSS NR gave up (see the log above)");
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(180),
+            "host not ready after 180 s"
+        );
+        let was_ready = nr.ready();
+        let tex = h.upload(w, ht, &input);
+        id += 1;
+        let t = std::time::Instant::now();
+        let mut ctx = RecordCtx {
+            gpu: &h.gpu,
+            layouts: &h.layouts,
+            rec: &mut h.rec,
+        };
+        nr.enhance(&mut ctx, FrameInput { id, tex: &tex }, processed == 0)
+            .expect("enhance");
+        // Time until the host's answer is visible here (the model's
+        // round trip: encode, hand-over, evaluation).
+        let mut round_trip = None;
+        while was_ready && t.elapsed() < std::time::Duration::from_secs(1) {
+            if nr.progress().is_some_and(|(n, _, out)| out >= n) {
+                round_trip = Some(t.elapsed().as_secs_f64() * 1e3);
+                break;
+            }
+        }
+        let got = h.readback(&tex);
+        if !was_ready {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            continue;
+        }
+        processed += 1;
+        let mut diff = 0.0f64;
+        for (g, s) in got.iter().zip(&input) {
+            for k in 0..3 {
+                assert!(g[k].is_finite(), "non-finite output");
+                diff += f64::from((g[k] - s[k]).abs());
+            }
+        }
+        let mean = diff / (got.len() * 3) as f64;
+        eprintln!(
+            "NR frame {processed} ({w}x{ht}): mean |out - in| {mean:.4}, model round trip {round_trip:.1?} ms"
+        );
+        assert!(mean > 1e-5, "the frame came back untouched");
+        assert!(mean < 0.25, "the edit is implausibly large: {mean}");
+    }
+    eprintln!("NR ready after {:.1} s", start.elapsed().as_secs_f64());
+}

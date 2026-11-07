@@ -224,7 +224,7 @@ fn rtx_video_dirs() -> Vec<std::path::PathBuf> {
     dirs
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 /// Folders searched for `nvngx_dlssnr.dll` (DLSS Neural Rendering), in
 /// order: the configured folder, `$CAPTUREPLAY_NR_RUNTIME`, the executable's
 /// folder, then `runtime/nvidia-nr` next to the executable or in any parent.
@@ -242,6 +242,65 @@ fn nr_runtime_dirs(s: &Settings) -> Vec<std::path::PathBuf> {
             .map(|d| d.join("runtime").join("nvidia-nr")),
     );
     dirs
+}
+
+#[cfg(target_os = "linux")]
+/// Where the Linux DLSS NR path finds its pieces:
+/// - `nvngx_dlssnr.dll` in [`nr_runtime_dirs`], then DLSS5VKLayer's import
+///   folder (`$XDG_DATA_HOME/dlssnr/binaries`) if that tool is installed;
+/// - `captureplay-nr-host.exe` (+ `captureplay_nvngx.dll`): `$CAPTUREPLAY_NR_HOST`,
+///   the same folders, then the cross build (`target/x86_64-pc-windows-gnu/release`)
+///   next to the executable's target folder;
+/// - Proton: the configured command, else the newest Proton in Steam;
+/// - the Wine prefix: configured, else `$XDG_DATA_HOME/CapturePlay/nr-prefix`.
+fn nr_proton_config(s: &Settings) -> Result<cp_render::ProtonNrConfig, String> {
+    use std::path::PathBuf;
+    let data_home = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
+        .unwrap_or_default();
+    let dirs = nr_runtime_dirs(s);
+    let snippet = dirs
+        .iter()
+        .map(|d| d.join("nvngx_dlssnr.dll"))
+        .chain(std::iter::once(
+            data_home.join("dlssnr/binaries/nvngx_dlssnr.dll"),
+        ))
+        .find(|p| p.is_file())
+        .ok_or("nvngx_dlssnr.dll not found (put it in runtime/nvidia-nr)")?;
+    let exe = std::env::current_exe().unwrap_or_default();
+    let host_exe = std::env::var_os("CAPTUREPLAY_NR_HOST")
+        .map(PathBuf::from)
+        .into_iter()
+        .chain(dirs.iter().map(|d| d.join("captureplay-nr-host.exe")))
+        .chain(
+            exe.ancestors()
+                .skip(1)
+                .map(|d| d.join("x86_64-pc-windows-gnu/release/captureplay-nr-host.exe")),
+        )
+        .find(|p| p.is_file())
+        .ok_or("captureplay-nr-host.exe not found (build it with scripts/build-nr-host.sh)")?;
+    let proton = if s.enhance.nr_proton.is_empty() {
+        let script = cp_render::nr_discover::proton_scripts()
+            .into_iter()
+            .next()
+            .ok_or("no Proton found in Steam; set enhance.nr_proton")?;
+        cp_render::nr_discover::proton_command(&script)
+    } else {
+        s.enhance.nr_proton.clone()
+    };
+    let prefix = s
+        .enhance
+        .nr_proton_prefix
+        .as_ref()
+        .map_or_else(|| data_home.join("CapturePlay/nr-prefix"), PathBuf::from);
+    Ok(cp_render::ProtonNrConfig {
+        proton,
+        prefix,
+        host_exe,
+        snippet,
+        preset: s.enhance.nr_preset.code(),
+    })
 }
 
 #[cfg(windows)]
@@ -274,10 +333,10 @@ fn ngx_feature_dirs(s: &Settings) -> Vec<std::path::PathBuf> {
     dirs
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 /// Live DLSS NR model tuning (read at every evaluation).
-fn nr_tuning(s: &cp_core::settings::EnhanceSettings) -> cp_nvidia::ngx::NrTuning {
-    cp_nvidia::ngx::NrTuning {
+fn nr_tuning(s: &cp_core::settings::EnhanceSettings) -> cp_nvidia::NrTuning {
+    cp_nvidia::NrTuning {
         style: s.nr_style.code(),
         intensity: s.nr_intensity,
         local_structure: s.nr_local_structure,
@@ -702,8 +761,53 @@ impl State {
         self.renderer.set_enhancer(enhancer);
     }
 
+    /// (Re)creates the DLSS NR stage when its settings changed. Linux has
+    /// no NGX feature 18: both NR choices run NVIDIA's Windows model in the
+    /// Proton-hosted `captureplay-nr-host`.
+    #[cfg(target_os = "linux")]
+    fn apply_enhancer(&mut self) {
+        use cp_core::settings::EnhanceBackend;
+        let want = self.settings.enhance.clone();
+        if let Some(prev) = self.enhance_backend.clone() {
+            let same = prev.backend == want.backend
+                && prev.nr_preset == want.nr_preset
+                && prev.nr_runtime_dir == want.nr_runtime_dir
+                && prev.nr_proton == want.nr_proton
+                && prev.nr_proton_prefix == want.nr_proton_prefix;
+            if same {
+                self.renderer.set_enhance_strength(want.nr_strength);
+                self.renderer.set_nr_tuning(nr_tuning(&want));
+                self.enhance_backend = Some(want);
+                return;
+            }
+        }
+        self.enhance_backend = Some(want.clone());
+        let enhancer: Option<Box<dyn cp_render::Enhancer>> = match want.backend {
+            EnhanceBackend::Off => None,
+            EnhanceBackend::NvidiaDlssNr | EnhanceBackend::NvidiaDlssNrCommunity => {
+                match nr_proton_config(&self.settings).and_then(|cfg| {
+                    cp_render::ProtonNrEnhancer::new(
+                        self.renderer.gpu(),
+                        self.renderer.layouts(),
+                        cfg,
+                        nr_tuning(&want),
+                        want.nr_strength,
+                    )
+                    .map_err(|e| e.to_string())
+                }) {
+                    Ok(e) => Some(Box::new(e)),
+                    Err(e) => {
+                        tracing::warn!("DLSS NR unavailable: {e}");
+                        None
+                    }
+                }
+            }
+        };
+        self.renderer.set_enhancer(enhancer);
+    }
+
     /// DLSS NR has no backend on this platform; the setting is kept.
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "linux")))]
     fn apply_enhancer(&mut self) {
         let want = self.settings.enhance.clone();
         if want.backend != cp_core::settings::EnhanceBackend::Off

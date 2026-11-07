@@ -20,6 +20,10 @@
           }
         } $out/lib/Linux_x86_64/libnvsdk_ngx.a
       '';
+      # Cross toolchain for the DLSS NR host (crates/nr-host, nr-bridge), a
+      # Windows program run under Proton: `cargo build --target
+      # x86_64-pc-windows-gnu` (see scripts/build-nr-host.sh).
+      mingw = pkgs.pkgsCross.mingwW64;
       # dlopen()ed at run time: the Vulkan loader, winit's Wayland/X11 backends.
       runtimeLibs = with pkgs; [
         vulkan-loader
@@ -42,6 +46,7 @@
           vulkan-tools
           vulkan-validation-layers
           v4l-utils
+          mingw.buildPackages.gcc # x86_64-w64-mingw32-{gcc,dlltool} for the NR host
         ];
         # Linked by cp-audio (pkg-config finds the .dev output here).
         buildInputs = [ pkgs.pipewire ];
@@ -51,6 +56,8 @@
         LD_LIBRARY_PATH = "${pkgs.lib.makeLibraryPath runtimeLibs}:/run/opengl-driver/lib";
         # Enabled with CAPTUREPLAY_VK_DEBUG=1.
         VK_ADD_LAYER_PATH = "${pkgs.vulkan-validation-layers}/share/vulkan/explicit_layer.d";
+        CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER = "x86_64-w64-mingw32-gcc";
+        CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUSTFLAGS = "-L native=${mingw.windows.pthreads}/lib";
       };
     };
 }
