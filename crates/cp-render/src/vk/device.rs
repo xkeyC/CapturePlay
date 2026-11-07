@@ -54,6 +54,7 @@ pub struct Gpu {
     pub surface_caps2_fn: Option<ash::khr::get_surface_capabilities2::Instance>,
     pub present_timing_fn: Option<PresentTimingFn>,
     pub calibrated_fn: Option<ash::khr::calibrated_timestamps::Device>,
+    pub hdr_metadata_fn: Option<ash::ext::hdr_metadata::Device>,
     pub external_memory_fn: Option<ash::khr::external_memory_fd::Device>,
     pub external_semaphore_fn: Option<ash::khr::external_semaphore_fd::Device>,
     /// `VkPhysicalDeviceIDProperties::deviceUUID` (matches the CUDA device).
@@ -266,6 +267,13 @@ impl Gpu {
                 enable.push(pt::KHR_PRESENT_ID_2.as_ptr());
                 enable.push(pt::KHR_CALIBRATED_TIMESTAMPS.as_ptr());
             }
+            // Content light levels for the compositor (on Wayland the
+            // driver turns them into the surface's image description).
+            let hdr_metadata =
+                swapchain_colorspace && has_ext(&dev_exts, ash::ext::hdr_metadata::NAME);
+            if hdr_metadata {
+                enable.push(ash::ext::hdr_metadata::NAME.as_ptr());
+            }
             let external_fd = has_ext(&dev_exts, ash::khr::external_memory_fd::NAME)
                 && has_ext(&dev_exts, ash::khr::external_semaphore_fd::NAME);
             if external_fd {
@@ -342,6 +350,8 @@ impl Gpu {
                 },
                 calibrated_fn: present_timing
                     .then(|| ash::khr::calibrated_timestamps::Device::new(&instance, &device)),
+                hdr_metadata_fn: hdr_metadata
+                    .then(|| ash::ext::hdr_metadata::Device::new(&instance, &device)),
                 surface_fn,
                 features: Features {
                     swapchain_colorspace,
@@ -548,6 +558,9 @@ impl Drop for Gpu {
         // GPU (the renderer drops its users first).
         unsafe {
             let _ = self.device.device_wait_idle();
+            if self.features.ngx {
+                cp_nvidia::ngx_vk::shutdown(self.device.handle());
+            }
             self.device.destroy_semaphore(self.timeline, None);
             self.device.destroy_device(None);
             if let Some((du, m)) = self.debug.take() {

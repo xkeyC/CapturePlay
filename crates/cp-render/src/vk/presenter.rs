@@ -81,6 +81,18 @@ pub struct Presenter {
     sent: std::collections::VecDeque<(u64, i64)>,
     /// Present call → first pixel out of the latest timed result (ns).
     pub present_to_display_ns: Option<i64>,
+    /// Light levels last handed to the compositor (re-applied to new
+    /// swapchains).
+    hdr_metadata: Option<HdrLevels>,
+}
+
+/// Content light levels of the output in the swapchain's encoding (what
+/// the compositor should assume the frames span).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HdrLevels {
+    pub max_nits: f32,
+    pub max_frame_average_nits: f32,
+    pub min_nits: f32,
 }
 
 /// Present timing state of the current swapchain.
@@ -250,6 +262,7 @@ impl Presenter {
             timing: None,
             sent: std::collections::VecDeque::new(),
             present_to_display_ns: None,
+            hdr_metadata: None,
         };
         p.recreate(gpu)?;
         tracing::info!(
@@ -378,6 +391,9 @@ impl Presenter {
                 gpu.swapchain_fn.destroy_swapchain(old, None);
             }
             self.swapchain = swapchain;
+            if let Some(levels) = self.hdr_metadata {
+                self.apply_hdr_metadata(gpu, levels);
+            }
             self.images = gpu.swapchain_fn.get_swapchain_images(swapchain)?;
             for &image in &self.images {
                 let view = gpu.device.create_image_view(
@@ -601,6 +617,42 @@ impl Presenter {
             _ => Some(false),
         };
         Some((duration as i64, vrr))
+    }
+
+    /// Tells the compositor how bright the frames get (`VK_EXT_hdr_metadata`;
+    /// on Wayland the driver puts it into the surface's image description).
+    /// Without it KWin assumes scRGB content peaks at the description's
+    /// nominal 80 and clips or compresses everything above.
+    pub fn set_hdr_metadata(&mut self, gpu: &Gpu, levels: Option<HdrLevels>) {
+        if levels == self.hdr_metadata {
+            return;
+        }
+        self.hdr_metadata = levels;
+        if let Some(l) = levels
+            && self.swapchain != vk::SwapchainKHR::null()
+        {
+            self.apply_hdr_metadata(gpu, l);
+        }
+    }
+
+    fn apply_hdr_metadata(&self, gpu: &Gpu, l: HdrLevels) {
+        let Some(f) = gpu.hdr_metadata_fn.as_ref() else {
+            return;
+        };
+        let xy = |x: f32, y: f32| vk::XYColorEXT { x, y };
+        // The frames may use the whole BT.2020 gamut (negative scRGB).
+        let metadata = vk::HdrMetadataEXT::default()
+            .display_primary_red(xy(0.708, 0.292))
+            .display_primary_green(xy(0.170, 0.797))
+            .display_primary_blue(xy(0.131, 0.046))
+            .white_point(xy(0.3127, 0.3290))
+            .max_luminance(l.max_nits)
+            .min_luminance(l.min_nits)
+            .max_content_light_level(l.max_nits)
+            .max_frame_average_light_level(l.max_frame_average_nits);
+        // SAFETY: a live swapchain of this device.
+        unsafe { f.set_hdr_metadata(&[self.swapchain], &[metadata]) };
+        tracing::debug!(?l, "HDR metadata");
     }
 
     /// Requests new back buffers of `width × height` (applied before the

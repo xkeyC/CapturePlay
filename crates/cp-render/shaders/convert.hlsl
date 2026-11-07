@@ -20,7 +20,7 @@ cbuffer Constants : register(b0)
     float hlg_gamma;
     uint width;
     uint height;
-    uint pad0;
+    float hdr_scale;      // output units per nit of PQ content (1 = absolute scRGB)
     float2 chroma_texel;  // 1 / chroma plane size
     float2 pad1;
 };
@@ -38,7 +38,7 @@ float3 to_scrgb(float3 rgbp)
 {
     float3 lin;
     if (transfer == TF_PQ)
-        lin = pq_to_nits(rgbp) / SCRGB_NITS;
+        lin = pq_to_nits(rgbp) * hdr_scale / SCRGB_NITS;
     else if (transfer == TF_HLG)
         lin = hlg_ootf(hlg_to_scene(rgbp), hlg_peak, hlg_gamma) / SCRGB_NITS;
     else if (transfer == TF_GAMMA22)

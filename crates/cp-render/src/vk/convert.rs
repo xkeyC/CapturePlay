@@ -24,7 +24,7 @@ struct Constants {
     hlg_gamma: f32,
     width: u32,
     height: u32,
-    pad0: u32,
+    hdr_scale: f32,
     chroma_texel: [f32; 2],
     pad1: [f32; 2],
 }
@@ -189,7 +189,7 @@ impl ConvertPass {
             hlg_gamma: 1.2 + 0.42 * (params.hlg_peak_nits / 1000.0).log10(),
             width: mode.width,
             height: mode.height,
-            pad0: 0,
+            hdr_scale: params.hdr_scale,
             chroma_texel: [1.0 / chroma.width as f32, 1.0 / chroma.height as f32],
             pad1: [0.0; 2],
         };

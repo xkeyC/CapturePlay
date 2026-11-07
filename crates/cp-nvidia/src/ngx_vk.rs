@@ -44,6 +44,16 @@ pub fn required_extensions() -> Option<(Vec<CString>, Vec<CString>)> {
     }
 }
 
+/// Shuts NGX down for `device` if it was initialized for it. Call after
+/// every feature was dropped and before the device is destroyed: NGX keeps
+/// device objects and its feature modules loaded until then, and tearing
+/// them down at process exit (after the device and driver are gone) crashes.
+#[cfg_attr(not(ngx), allow(unused_variables))]
+pub fn shutdown(device: vk::Device) {
+    #[cfg(ngx)]
+    imp::shutdown(device);
+}
+
 /// The Vulkan objects NGX is initialized with.
 #[derive(Clone, Copy)]
 pub struct VkContext {
@@ -231,6 +241,8 @@ mod imp {
             version: u32,
         ) -> u32;
         fn NVSDK_NGX_VULKAN_GetCapabilityParameters(out: *mut *mut Parameter) -> u32;
+        fn NVSDK_NGX_VULKAN_ReleaseFeature(handle: *mut Handle) -> u32;
+        fn NVSDK_NGX_VULKAN_Shutdown1(device: vk::Device) -> u32;
         fn NVSDK_NGX_VULKAN_CreateFeature(
             cmd: vk::CommandBuffer,
             feature: i32,
@@ -277,14 +289,31 @@ mod imp {
     static LOCK: Mutex<()> = Mutex::new(());
 
     /// The process-wide NGX instance: capability parameters (owned by NGX)
-    /// for the device it was initialized with. NGX stays initialized until
-    /// the process exits, like the other NVIDIA runtimes.
+    /// for the device it was initialized with, until [`shutdown`].
     struct Instance {
         device: vk::Device,
         params: usize,
     }
 
     static INSTANCE: OnceLock<Result<Instance, String>> = OnceLock::new();
+    /// Set by [`shutdown`]: NGX cannot be initialized again in this process.
+    static SHUT_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    pub(super) fn shutdown(device: vk::Device) {
+        let _g = LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(Ok(i)) = INSTANCE.get()
+            && i.device == device
+            && !SHUT_DOWN.swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            // SAFETY: the device is idle and every feature was released.
+            let r = unsafe { NVSDK_NGX_VULKAN_Shutdown1(device) };
+            if !succeeded(r) {
+                tracing::warn!("NVSDK_NGX_VULKAN_Shutdown1 failed: {r:#x}");
+            }
+        }
+    }
 
     fn wide(s: &Path) -> Vec<WChar> {
         s.to_string_lossy()
@@ -376,6 +405,7 @@ mod imp {
             })
         });
         match init {
+            _ if SHUT_DOWN.load(std::sync::atomic::Ordering::Acquire) => Err(NgxError::Unavailable),
             Ok(i) if i.device == ctx.device => Ok(i),
             Ok(_) => Err(NgxError::Call {
                 call: "NGX already initialized for another device",
@@ -395,6 +425,21 @@ mod imp {
 
     // SAFETY: the handle is used under `LOCK` only, from one thread at a time.
     unsafe impl Send for Feature {}
+
+    impl Drop for Feature {
+        fn drop(&mut self) {
+            let _g = LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if SHUT_DOWN.load(std::sync::atomic::Ordering::Acquire) {
+                return;
+            }
+            // SAFETY: created by CreateFeature; the owner waited for the GPU.
+            unsafe {
+                let _ = NVSDK_NGX_VULKAN_ReleaseFeature(self.handle);
+            }
+        }
+    }
 
     fn resource(img: &VkImage, read_write: bool) -> ResourceVk {
         ResourceVk {

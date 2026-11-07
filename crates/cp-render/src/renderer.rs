@@ -738,6 +738,8 @@ impl Renderer {
     fn decode_params(&self) -> DecodeParams {
         let d = self.presenter.display.info();
         DecodeParams {
+            // DWM's scRGB is absolute: 1.0 = 80 nits.
+            hdr_scale: 1.0,
             sdr_white_nits: self.config.sdr_white_override.unwrap_or(if d.hdr {
                 d.sdr_white_nits
             } else {
