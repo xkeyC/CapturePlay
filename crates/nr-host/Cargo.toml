@@ -1,0 +1,28 @@
+[package]
+name = "nr-host"
+description = "Wine/Proton host process running DLSS Neural Rendering for the Linux build (CapturePlay experimental)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "captureplay-nr-host"
+path = "src/main.rs"
+
+# A Windows program: built for x86_64-pc-windows-gnu and run under
+# Wine/Proton next to captureplay_nvngx.dll (nr-bridge). Built natively on
+# Linux it is the other end of the probe: `import-test` starts the Windows
+# build and imports what it exports.
+[target.'cfg(windows)'.dependencies]
+ash = { workspace = true }
+windows = { workspace = true }
+
+# The native side's import test (`captureplay-nr-host import-test`).
+[target.'cfg(target_os = "linux")'.dependencies]
+ash = { workspace = true }
+libc = { workspace = true }
+
+[lints]
+workspace = true
