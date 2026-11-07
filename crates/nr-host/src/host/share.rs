@@ -115,7 +115,6 @@ pub fn with_new_fd<T>(create: impl FnOnce() -> Result<T>) -> Result<(T, i32)> {
         .filter(|h| before.binary_search(h).is_err())
         .map(|h| (h, type_name(query, h).unwrap_or_else(|| "?".into())))
         .collect();
-    log!("nr-host: new handles {fresh:x?}");
     for (h, ty) in &fresh {
         if !ty.is_empty() {
             continue;

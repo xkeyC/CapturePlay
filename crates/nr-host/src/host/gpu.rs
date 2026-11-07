@@ -156,6 +156,11 @@ impl Gpu {
     /// `VkPhysicalDeviceIDProperties::deviceUUID` as hex (the native side
     /// picks the same device by it).
     pub fn uuid_hex(&self) -> String {
+        self.uuid().iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// `VkPhysicalDeviceIDProperties::deviceUUID`.
+    pub fn uuid(&self) -> [u8; 16] {
         let mut id = vk::PhysicalDeviceIDProperties::default();
         let mut props = vk::PhysicalDeviceProperties2::default().push_next(&mut id);
         // SAFETY: valid physical device.
@@ -163,7 +168,7 @@ impl Gpu {
             self.instance
                 .get_physical_device_properties2(self.physical, &mut props);
         }
-        id.device_uuid.iter().map(|b| format!("{b:02x}")).collect()
+        id.device_uuid
     }
 
     pub fn has(&self, extension: &CStr) -> bool {
@@ -221,6 +226,69 @@ impl Gpu {
         }
     }
 
+    /// `n` command buffers with signalled fences, for [`Ring`].
+    pub fn ring(&self, n: usize) -> Result<Ring> {
+        let d = &self.device;
+        // SAFETY: our pool; objects are destroyed by `Ring::drop`.
+        unsafe {
+            let cmds = d
+                .allocate_command_buffers(
+                    &vk::CommandBufferAllocateInfo::default()
+                        .command_pool(self.pool)
+                        .command_buffer_count(n as u32),
+                )
+                .map_err(vk_err("vkAllocateCommandBuffers"))?;
+            let mut slots = Vec::with_capacity(n);
+            for cmd in cmds {
+                let fence = d
+                    .create_fence(
+                        &vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED),
+                        None,
+                    )
+                    .map_err(vk_err("vkCreateFence"))?;
+                slots.push((cmd, fence));
+            }
+            Ok(Ring {
+                device: d.clone(),
+                pool: self.pool,
+                slots,
+                next: 0,
+            })
+        }
+    }
+
+    /// Submits `cmd` waiting for `wait` (timeline value) and signalling
+    /// `signal`, then `fence`.
+    pub fn submit_timeline(
+        &self,
+        cmd: vk::CommandBuffer,
+        wait: (vk::Semaphore, u64),
+        signal: (vk::Semaphore, u64),
+        fence: vk::Fence,
+    ) -> Result<()> {
+        let waits = [vk::SemaphoreSubmitInfo::default()
+            .semaphore(wait.0)
+            .value(wait.1)
+            .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)];
+        let signals = [vk::SemaphoreSubmitInfo::default()
+            .semaphore(signal.0)
+            .value(signal.1)
+            .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)];
+        let cmds = [vk::CommandBufferSubmitInfo::default().command_buffer(cmd)];
+        // SAFETY: a fully recorded command buffer and live semaphores.
+        unsafe {
+            self.device.queue_submit2(
+                self.queue,
+                &[vk::SubmitInfo2::default()
+                    .wait_semaphore_infos(&waits)
+                    .command_buffer_infos(&cmds)
+                    .signal_semaphore_infos(&signals)],
+                fence,
+            )
+        }
+        .map_err(vk_err("vkQueueSubmit2"))
+    }
+
     /// Full barrier between whatever came before and after (every image
     /// stays in GENERAL).
     pub fn barrier(&self, cmd: vk::CommandBuffer) {
@@ -246,6 +314,87 @@ impl Drop for Gpu {
             self.device.destroy_device(None);
             self.instance.destroy_instance(None);
         }
+    }
+}
+
+/// Command buffers reused round-robin, each guarded by a fence.
+pub struct Ring {
+    device: ash::Device,
+    pool: vk::CommandPool,
+    slots: Vec<(vk::CommandBuffer, vk::Fence)>,
+    next: usize,
+}
+
+impl Ring {
+    /// The next command buffer, reset and begun, with its (unsignalled)
+    /// fence for the submit.
+    pub fn begin(&mut self) -> Result<(vk::CommandBuffer, vk::Fence)> {
+        let (cmd, fence) = self.slots[self.next];
+        self.next = (self.next + 1) % self.slots.len();
+        let d = &self.device;
+        // SAFETY: the fence guards the buffer's previous submission.
+        unsafe {
+            d.wait_for_fences(&[fence], true, u64::MAX)
+                .map_err(vk_err("vkWaitForFences"))?;
+            d.reset_fences(&[fence]).map_err(vk_err("vkResetFences"))?;
+            d.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())
+                .map_err(vk_err("vkResetCommandBuffer"))?;
+            d.begin_command_buffer(
+                cmd,
+                &vk::CommandBufferBeginInfo::default()
+                    .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+            )
+            .map_err(vk_err("vkBeginCommandBuffer"))?;
+        }
+        Ok((cmd, fence))
+    }
+}
+
+impl Drop for Ring {
+    fn drop(&mut self) {
+        // SAFETY: waits for every slot before freeing it.
+        unsafe {
+            for &(cmd, fence) in &self.slots {
+                let _ = self.device.wait_for_fences(&[fence], true, u64::MAX);
+                self.device.destroy_fence(fence, None);
+                self.device.free_command_buffers(self.pool, &[cmd]);
+            }
+        }
+    }
+}
+
+/// Ownership hand-over of `image` (kept in GENERAL) between this queue
+/// family and the other process: `acquire` takes it from the external
+/// owner, otherwise it is released to it.
+pub fn external_barrier(
+    device: &ash::Device,
+    cmd: vk::CommandBuffer,
+    family: u32,
+    image: vk::Image,
+    acquire: bool,
+) {
+    let (src, dst) = if acquire {
+        (vk::QUEUE_FAMILY_EXTERNAL, family)
+    } else {
+        (family, vk::QUEUE_FAMILY_EXTERNAL)
+    };
+    let b = [vk::ImageMemoryBarrier2::default()
+        .src_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+        .src_access_mask(vk::AccessFlags2::MEMORY_WRITE)
+        .dst_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+        .dst_access_mask(vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE)
+        .old_layout(vk::ImageLayout::GENERAL)
+        .new_layout(vk::ImageLayout::GENERAL)
+        .src_queue_family_index(src)
+        .dst_queue_family_index(dst)
+        .image(image)
+        .subresource_range(color_range())];
+    // SAFETY: recording command buffer.
+    unsafe {
+        device.cmd_pipeline_barrier2(
+            cmd,
+            &vk::DependencyInfo::default().image_memory_barriers(&b),
+        );
     }
 }
 

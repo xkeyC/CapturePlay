@@ -25,6 +25,7 @@ pub mod device;
 pub mod display;
 pub mod egui_pass;
 pub mod interp_vfg;
+pub mod nr_proton;
 pub mod output;
 pub mod pipeline;
 pub mod present_timing_ext;
@@ -39,7 +40,7 @@ pub mod upload;
 pub mod upscale_ngx;
 
 pub use interp_vfg::VfgInterpolator;
-pub use renderer::{FrameInput, Interpolator, RecordCtx, Renderer, Upscaler};
+pub use renderer::{Enhancer, FrameInput, Interpolator, RecordCtx, Renderer, Upscaler};
 pub use upscale_ngx::NgxVsrUpscaler;
 
 use ash::vk;

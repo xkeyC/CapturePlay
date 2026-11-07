@@ -83,7 +83,38 @@ pub trait Upscaler {
     fn upscale(&mut self, ctx: &mut RecordCtx<'_>, src: &Texture, out: &Texture) -> Result<()>;
 }
 
-/// A unique source frame handed to an interpolator.
+/// Per-frame enhancement of every unique working frame in place, right
+/// after conversion (before interpolation and upscaling see it).
+pub trait Enhancer {
+    fn name(&self) -> &'static str;
+
+    /// Whether frames are processed. False while a model loads or after it
+    /// failed: frames pass through unchanged.
+    fn ready(&self) -> bool {
+        true
+    }
+
+    /// Content description for backends that work in a display-referred
+    /// space: whether the source is HDR, and SDR white in scRGB units.
+    fn set_content(&mut self, _hdr: bool, _sdr_white: f32) {}
+
+    /// Residual gain; changing it must not reload a model.
+    fn set_strength(&mut self, _strength: f32) {}
+
+    /// Live DLSS NR model tuning; ignored by other enhancers.
+    fn set_nr_tuning(&mut self, _tuning: cp_nvidia::ngx_vk::NrTuning) {}
+
+    /// `reset` is true for the first frame after a source change or a
+    /// discontinuity (temporal history must be discarded).
+    fn enhance(
+        &mut self,
+        ctx: &mut RecordCtx<'_>,
+        frame: FrameInput<'_>,
+        reset: bool,
+    ) -> Result<()>;
+}
+
+/// A unique source frame handed to an interpolator or enhancer.
 #[derive(Debug, Clone, Copy)]
 pub struct FrameInput<'a> {
     pub id: u64,
@@ -146,6 +177,8 @@ impl Drop for FrameCtx {
 #[derive(Clone, Copy)]
 struct NewFrame {
     id: u64,
+    /// Pool index of the converted working frame.
+    pi: usize,
     info: cp_core::cadence::CadenceInfo,
     observed_ns: i64,
     signal_ns: i64,
@@ -162,6 +195,7 @@ pub struct Renderer {
     frames: Vec<FrameCtx>,
     timer: GpuTimer,
     upscale_timer: GpuTimer,
+    enhance_timer: GpuTimer,
     frame_index: usize,
     convert: ConvertPass,
     output: OutputPass,
@@ -169,6 +203,9 @@ pub struct Renderer {
     pool: Vec<PooledFrame>,
     interp_out: Option<Texture>,
     interpolator: Option<Box<dyn Interpolator>>,
+    enhancer: Option<Box<dyn Enhancer>>,
+    /// The next enhanced frame discards temporal history.
+    enhance_reset: bool,
     freeze: Freeze,
     upscaler: Option<Box<dyn Upscaler>>,
     upscaled: Option<Texture>,
@@ -268,6 +305,7 @@ impl Renderer {
         Ok(Self {
             timer: GpuTimer::new(&gpu, FRAMES_IN_FLIGHT)?,
             upscale_timer: GpuTimer::new(&gpu, FRAMES_IN_FLIGHT)?,
+            enhance_timer: GpuTimer::new(&gpu, FRAMES_IN_FLIGHT)?,
             convert: ConvertPass::new(&gpu, &layouts)?,
             output: OutputPass::new(&gpu, &layouts, presenter.format)?,
             egui: EguiPass::new(&gpu, &layouts, presenter.format)?,
@@ -275,6 +313,8 @@ impl Renderer {
             frame_index: 0,
             pool: Vec::new(),
             interp_out: None,
+            enhancer: None,
+            enhance_reset: true,
             interpolator: None,
             freeze: Freeze::Off,
             upscaler: None,
@@ -372,14 +412,65 @@ impl Renderer {
         self.upscaler.as_ref().map(|u| u.name())
     }
 
-    /// The enhancement (DLSS NR) stage has no backend on Vulkan.
-    pub fn enhancer_name(&self) -> Option<&'static str> {
-        None
+    pub fn set_enhancer(&mut self, enhancer: Option<Box<dyn Enhancer>>) {
+        let _ = self.gpu.wait_idle();
+        self.enhancer = enhancer;
+        self.enhance_reset = true;
     }
 
-    /// See [`Self::enhancer_name`]: nothing loads, so nothing is pending.
+    pub fn enhancer_name(&self) -> Option<&'static str> {
+        self.enhancer.as_ref().map(|e| e.name())
+    }
+
+    /// Whether the active enhancer currently processes frames.
     pub fn enhancer_ready(&self) -> bool {
-        true
+        self.enhancer.as_ref().is_none_or(|e| e.ready())
+    }
+
+    /// Updates the enhancement strength without rebuilding the backend.
+    pub fn set_enhance_strength(&mut self, strength: f32) {
+        if let Some(e) = self.enhancer.as_mut() {
+            e.set_strength(strength);
+        }
+    }
+
+    /// Updates DLSS NR model tuning without rebuilding the backend.
+    pub fn set_nr_tuning(&mut self, tuning: cp_nvidia::ngx_vk::NrTuning) {
+        if let Some(e) = self.enhancer.as_mut() {
+            e.set_nr_tuning(tuning);
+        }
+    }
+
+    fn run_enhancer(&mut self, pool_index: usize, id: u64, reset: bool) {
+        let Some(mut e) = self.enhancer.take() else {
+            return;
+        };
+        let hdr = self.stats.color.is_some_and(|c| c.is_hdr());
+        e.set_content(
+            hdr,
+            self.decode_params().sdr_white_nits / cp_core::color::SCRGB_UNIT_NITS,
+        );
+        let f = &mut self.frames[self.frame_index];
+        self.enhance_timer.begin(f.rec.cmd(), self.frame_index);
+        let mut ctx = RecordCtx {
+            gpu: &self.gpu,
+            layouts: &self.layouts,
+            rec: &mut f.rec,
+        };
+        let r = e.enhance(
+            &mut ctx,
+            FrameInput {
+                id,
+                tex: &self.pool[pool_index].tex,
+            },
+            reset,
+        );
+        self.enhance_timer
+            .end(self.frames[self.frame_index].rec.cmd(), self.frame_index);
+        match r {
+            Ok(()) => self.enhancer = Some(e),
+            Err(err) => tracing::error!("enhancer {} failed, disabling it: {err}", e.name()),
+        }
     }
 
     /// Upscaled size for a presented frame of `src` size, once the backend
@@ -482,11 +573,18 @@ impl Renderer {
     fn schedule_frame(&mut self, f: &NewFrame, refresh: Refresh) {
         let NewFrame {
             id,
+            pi,
             info,
             observed_ns,
             signal_ns,
             arrival,
         } = *f;
+        // Long gaps (menus, stalls) break temporal history too.
+        let gap = info
+            .interval_ns
+            .is_some_and(|iv| info.content_interval_ns.is_some_and(|c| iv > c * 4));
+        let reset = std::mem::take(&mut self.enhance_reset) || gap;
+        self.run_enhancer(pi, id, reset);
         self.stats.unique += 1;
         if let Some(iv) = info.content_interval_ns {
             self.stats.content_fps = 1e9 / iv as f64;
@@ -538,6 +636,7 @@ impl Renderer {
         self.cadence.reset();
         self.reset_timeline();
         self.shown = None;
+        self.enhance_reset = true;
         for p in &mut self.pool {
             p.id = None;
         }
@@ -599,12 +698,18 @@ impl Renderer {
     /// Time from starting to compose a slot until it is ready to present.
     fn lead_ns(&self) -> i64 {
         let gpu = (self.stats.interp_gpu_ms * 1e6) as i64;
+        // Enhancement runs on ingest, before a frame can be scheduled.
+        let enhance = if self.enhancer.is_some() && self.stats.enhance_gpu_ms > 0.0 {
+            (self.stats.enhance_gpu_ms * 1e6) as i64
+        } else {
+            0
+        };
         let upscale = if self.stats.upscale.is_some() {
             (self.stats.upscale_ms * 1e6) as i64
         } else {
             0
         };
-        (gpu + upscale + 1_500_000).clamp(2_000_000, 14_000_000)
+        (gpu + enhance + upscale + 1_500_000).clamp(2_000_000, 14_000_000)
     }
 
     /// The swapchain carries scRGB and the compositor color-manages it.
@@ -730,6 +835,10 @@ impl Renderer {
         let f = &mut self.frames[i];
         self.egui
             .free_textures(&std::mem::take(&mut f.pending_free));
+        if let Some(ms) = self.enhance_timer.read(i) {
+            let s = &mut self.stats.enhance_gpu_ms;
+            *s = if *s == 0.0 { ms } else { *s * 0.9 + ms * 0.1 };
+        }
         if let Some(ms) = self.upscale_timer.read(i) {
             let s = &mut self.stats.upscale_ms;
             *s = if *s == 0.0 { ms } else { *s * 0.9 + ms * 0.1 };
@@ -850,6 +959,7 @@ impl Renderer {
             converted_slots.push(f.slot);
             let frame = NewFrame {
                 id,
+                pi,
                 info,
                 observed_ns: f.meta.device_time.0,
                 signal_ns,

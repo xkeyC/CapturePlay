@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 
 use ash::vk;
 
-pub use crate::ngx_common::{NgxError, VsrQuality};
+pub use crate::ngx_common::{NgxError, NrOptions, NrTuning, VsrQuality};
 
 /// Whether the NGX backend was compiled in.
 pub const fn built() -> bool {

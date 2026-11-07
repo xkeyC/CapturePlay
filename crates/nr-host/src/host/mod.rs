@@ -1,7 +1,8 @@
-//! The host program. For now one command, `probe`, which checks every link
-//! of the chain on this machine: winevulkan's extensions, the parameter
-//! ABI, snippet init, feature creation, one evaluated frame and the export
-//! of its output as a Linux file descriptor.
+//! The host program:
+//! - `serve` ([`serve`]) is what CapturePlay runs;
+//! - `probe` checks every link of the chain on this machine: winevulkan's
+//!   extensions, snippet init, feature creation, one evaluated frame and the
+//!   export of its output as a Linux file descriptor.
 
 /// Writes a line to stderr and to `captureplay-nr-host.log` beside the
 /// executable (Proton does not always pass a console program's stderr on).
@@ -14,6 +15,7 @@ macro_rules! log {
 mod gpu;
 mod ngx;
 mod params;
+mod serve;
 mod share;
 
 pub fn log_line(line: &str) {
@@ -50,15 +52,18 @@ struct Args {
     hold_s: u64,
 }
 
-fn parse() -> Result<Args> {
+enum Command {
+    Probe(Args),
+    Serve(serve::Args),
+}
+
+const USAGE: &str = "usage: captureplay-nr-host probe --snippet <nvngx_dlssnr.dll> \
+    [--bridge <captureplay_nvngx.dll>] [--size WxH] [--frames N] [--hold SECONDS]\n\
+    or: captureplay-nr-host serve --snippet <dll> --shm <file> [--bridge <dll>] [--parent PID]";
+
+fn parse() -> Result<Command> {
     let mut a = std::env::args().skip(1);
-    if a.next().as_deref() != Some("probe") {
-        return Err(
-            "usage: captureplay-nr-host probe --snippet <nvngx_dlssnr.dll> \
-                    [--bridge <captureplay_nvngx.dll>] [--size WxH] [--frames N] [--hold SECONDS]"
-                .into(),
-        );
-    }
+    let command = a.next().ok_or(USAGE)?;
     let exe_dir = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(PathBuf::from))
@@ -70,6 +75,7 @@ fn parse() -> Result<Args> {
         frames: 30,
         hold_s: 0,
     };
+    let (mut shm, mut parent) = (PathBuf::new(), None);
     while let Some(k) = a.next() {
         let v = a.next().ok_or_else(|| format!("{k} needs a value"))?;
         match k.as_str() {
@@ -84,19 +90,34 @@ fn parse() -> Result<Args> {
             }
             "--frames" => args.frames = v.parse().map_err(|_| "--frames N")?,
             "--hold" => args.hold_s = v.parse().map_err(|_| "--hold SECONDS")?,
+            "--shm" => shm = v.into(),
+            "--parent" => parent = Some(v.parse().map_err(|_| "--parent PID")?),
             // Lets the native side find this process; otherwise unused.
             "--token" => {}
-            _ => return Err(format!("unknown option {k}")),
+            _ => return Err(format!("unknown option {k}\n{USAGE}")),
         }
     }
     if args.snippet.as_os_str().is_empty() {
         return Err("--snippet is required".into());
     }
-    Ok(args)
+    match command.as_str() {
+        "probe" => Ok(Command::Probe(args)),
+        "serve" if !shm.as_os_str().is_empty() => Ok(Command::Serve(serve::Args {
+            bridge: args.bridge,
+            snippet: args.snippet,
+            shm,
+            parent,
+        })),
+        _ => Err(USAGE.into()),
+    }
 }
 
 pub fn main() -> i32 {
-    match parse().and_then(|a| probe(&a)) {
+    let r = parse().and_then(|c| match c {
+        Command::Probe(a) => probe(&a),
+        Command::Serve(a) => serve::serve(&a),
+    });
+    match r {
         Ok(()) => 0,
         Err(e) => {
             log!("nr-host: FAILED: {e}");

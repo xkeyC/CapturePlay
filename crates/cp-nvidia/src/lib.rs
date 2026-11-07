@@ -18,6 +18,10 @@ pub mod cuda;
 pub mod ngx;
 #[cfg(any(windows, target_os = "linux"))]
 mod ngx_common;
+/// DLSS Neural Rendering options, shared by the D3D12 binding and the Linux
+/// (Proton host) path.
+#[cfg(any(windows, target_os = "linux"))]
+pub use ngx_common::{NrOptions, NrTuning};
 #[cfg(target_os = "linux")]
 pub mod ngx_vk;
 #[cfg(any(windows, target_os = "linux"))]

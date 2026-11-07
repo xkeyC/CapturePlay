@@ -72,6 +72,7 @@ nothing here.
 |---|---|---|
 | `nvidia-vfx/` | The `nvidia-vfx` wheel for Linux (`nvidia_vfx-*-manylinux_*.whl` on pypi.nvidia.com), unzipped as-is (`nvvfx/libs/` + `nvidia_vfx.libs/`), or just the contents of `nvvfx/libs` plus `libcudart-*.so*` | AI frame interpolation (`libnvVFXVideoFrameGeneration.so`, CUDA ↔ Vulkan) and RTX VSR (`libnvidia-ngx-vsr.so`, NGX on Vulkan) |
 | `ngx-sdk/` | `lib/Linux_x86_64/libnvsdk_ngx.a` from NVIDIA's DLSS SDK (github.com/NVIDIA/DLSS) | Build time: the static NGX loader for VSR. The flake dev shell provides it as `$CAPTUREPLAY_NGX_SDK` |
+| `nvidia-nr/` | `captureplay-nr-host.exe` + `captureplay_nvngx.dll` (built by `scripts/build-nr-host.sh`) and your `nvngx_dlssnr.dll` | DLSS Neural Rendering, run under Proton. Also found: the host via `$CAPTUREPLAY_NR_HOST` or the cross build in `target/`, the model via `$CAPTUREPLAY_NR_RUNTIME` or DLSS5VKLayer's `$XDG_DATA_HOME/dlssnr/binaries` |
 
 Lookup order of the runtime: `interpolation.vfx_runtime_dir` in
 `settings.toml` → `CAPTUREPLAY_VFX_RUNTIME` → `runtime/nvidia-vfx` next to
@@ -82,3 +83,6 @@ on NixOS, which the dev shell adds to `LD_LIBRARY_PATH`).
 
 The GPU tests that need the runtime run on request:
 `CAPTUREPLAY_VFX_RUNTIME=<dir> cargo test -p cp-render -- --ignored`.
+NR end to end (Proton, the host and the model in place):
+`cargo test -p cp-render nr_proton -- --ignored --nocapture`
+(`CAPTUREPLAY_NR_SIZE=2560x1440` for another size).

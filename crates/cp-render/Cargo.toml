@@ -33,6 +33,7 @@ wayland-client.workspace = true
 wayland-backend.workspace = true
 wayland-protocols.workspace = true
 wayland-scanner.workspace = true
+nr-proto.workspace = true
 # Bitfield enums of the generated Wayland bindings.
 bitflags.workspace = true
 

@@ -15,6 +15,7 @@ cp-capture = { path = "crates/cp-capture" }
 cp-audio = { path = "crates/cp-audio" }
 cp-render = { path = "crates/cp-render" }
 cp-nvidia = { path = "crates/cp-nvidia" }
+nr-proto = { path = "crates/nr-proto" }
 
 anyhow = "1.0"
 thiserror = "2.0"
@@ -58,6 +59,7 @@ windows = { version = "0.62", features = [
     "Win32_System_Com_StructuredStorage",
     "Win32_System_Variant",
     "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
     "Win32_System_Performance",
     "Win32_System_Threading",
     "Win32_System_WindowsProgramming",

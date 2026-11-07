@@ -104,9 +104,11 @@ cargo build --release
 ./target/release/capture-play
 ~~~
 
-当前状态：采集、色彩转换、HDR 输出（scRGB，按 compositor 的参考亮度换算）、UI、呈现时序反馈（`VK_EXT_present_timing`）、PipeWire 音频直通可用；补帧（VFG，CUDA ↔ Vulkan 互操作）与超分（VSR，NGX on Vulkan）已实现，需要 NVIDIA Video Effects 运行库（见 `runtime/README.md`），待实机验证；NR 不支持。设置位于 `$XDG_CONFIG_HOME/CapturePlay/`（默认 `~/.config/CapturePlay/`），`CAPTUREPLAY_VK_DEBUG=1` 启用 Vulkan 验证层，`CAPTUREPLAY_VK_TIMED_PRESENT=1` 试用按目标时间呈现（实验）。
+当前状态：采集、色彩转换、HDR 输出（scRGB，按 compositor 的参考亮度换算）、UI、呈现时序反馈（`VK_EXT_present_timing`）、PipeWire 音频直通可用；补帧（VFG，CUDA ↔ Vulkan 互操作）与超分（VSR，NGX on Vulkan）已实现，需要 NVIDIA Video Effects 运行库（见 `runtime/README.md`），待实机验证；NR 通过 Proton 运行（见下）。设置位于 `$XDG_CONFIG_HOME/CapturePlay/`（默认 `~/.config/CapturePlay/`），`CAPTUREPLAY_VK_DEBUG=1` 启用 Vulkan 验证层，`CAPTUREPLAY_VK_TIMED_PRESENT=1` 试用按目标时间呈现（实验）。
 
 VRR 由 KWin 决定：在“显示设置 → 自适应同步”中选“自动”（仅对全屏的活动窗口生效）或“始终”，再按 F11 全屏；程序读取该策略作为刷新检测的初值，并把窗口标记为游戏内容，使电视进入低延迟游戏模式。关闭垂直同步时，需在 KDE 中允许全屏撕裂。
+
+NR（实验）：NVIDIA 只提供 Windows 版 `nvngx_dlssnr.dll`，Linux 上由 `captureplay-nr-host.exe` 在 Proton 中运行模型（NGX on Vulkan，经 winevulkan），画面与同步通过显存 fd 与 timeline 信号量在两个进程间零拷贝传递，每帧不做 CPU 等待；1440p 推理约 5.7 ms。准备：`rustup target add x86_64-pc-windows-gnu`，在 `nix develop` 中运行 `scripts/build-nr-host.sh`（生成并安装 helper 与 `captureplay_nvngx.dll` 到 `runtime/nvidia-nr/`），再放入自备的 `nvngx_dlssnr.dll`。Proton 默认取 Steam 中最新的版本（NixOS 上自动经 `steam-run`），也可在 `settings.toml` 的 `[enhance]` 中用 `nr_proton = ["steam-run", "/…/proton"]` 与 `nr_proton_prefix` 指定；首次启用需数秒启动 Proton，期间画面直通。helper 日志写在 exe 旁的 `captureplay-nr-host.log`。
 
 ### 1.7 注意事项
 

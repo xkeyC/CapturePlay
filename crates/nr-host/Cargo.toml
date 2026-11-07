@@ -15,6 +15,9 @@ path = "src/main.rs"
 # Wine/Proton next to captureplay_nvngx.dll (nr-bridge). Built natively on
 # Linux it is the other end of the probe: `import-test` starts the Windows
 # build and imports what it exports.
+[dependencies]
+nr-proto = { workspace = true }
+
 [target.'cfg(windows)'.dependencies]
 ash = { workspace = true }
 windows = { workspace = true }

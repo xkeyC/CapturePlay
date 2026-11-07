@@ -70,6 +70,9 @@ pub use texture::Texture;
 #[cfg(windows)]
 pub use upscale_ngx::NgxVsrUpscaler;
 #[cfg(target_os = "linux")]
+pub use vk::nr_proton::{ProtonNrConfig, ProtonNrEnhancer, discover as nr_discover};
+#[cfg(target_os = "linux")]
 pub use vk::{
-    FrameInput, Interpolator, NgxVsrUpscaler, RecordCtx, Renderer, Upscaler, VfgInterpolator,
+    Enhancer, FrameInput, Interpolator, NgxVsrUpscaler, RecordCtx, Renderer, Upscaler,
+    VfgInterpolator,
 };

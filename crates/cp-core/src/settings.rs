@@ -149,6 +149,13 @@ pub struct EnhanceSettings {
     /// Directory with nvngx_dlssnr.dll. `None` = $CAPTUREPLAY_NR_RUNTIME,
     /// then runtime/nvidia-nr next to the exe.
     pub nr_runtime_dir: Option<String>,
+    /// Linux: the command running Proton's `proton` script for the DLSS NR
+    /// host, e.g. `["steam-run", "/…/Proton 11.0/proton"]`. Empty = the
+    /// newest Proton in Steam's folders (through `steam-run` on NixOS).
+    pub nr_proton: Vec<String>,
+    /// Linux: Wine prefix of the DLSS NR host. `None` =
+    /// `$XDG_DATA_HOME/CapturePlay/nr-prefix`.
+    pub nr_proton_prefix: Option<String>,
 }
 
 impl Default for EnhanceSettings {
@@ -165,6 +172,8 @@ impl Default for EnhanceSettings {
             nr_auto_mask: false,
             nr_ui_correction: false,
             nr_runtime_dir: None,
+            nr_proton: Vec::new(),
+            nr_proton_prefix: None,
         }
     }
 }

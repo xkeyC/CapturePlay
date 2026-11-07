@@ -16,7 +16,7 @@ use windows::Win32::Graphics::Direct3D12::{
     ID3D12Device, ID3D12GraphicsCommandList, ID3D12Resource,
 };
 
-pub use crate::ngx_common::{NgxError, VsrQuality};
+pub use crate::ngx_common::{NgxError, NrOptions, NrTuning, VsrQuality};
 
 /// Whether the NGX backend was compiled in.
 pub const fn built() -> bool {
@@ -31,49 +31,6 @@ pub fn runtime_present(dir: &Path) -> bool {
 /// Feature DLL (nvngx_dlssnr.dll) found in dir.
 pub fn nr_runtime_present(dir: &Path) -> bool {
     dir.join("nvngx_dlssnr.dll").is_file()
-}
-
-/// Create-time options for DLSS Neural Rendering (NGX feature 18).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct NrOptions {
-    /// DLSSNR.Hint.Render.Preset: 0 leaves the model's default (or auto),
-    /// 1 selects the quality model and 2 the performance model on the
-    /// 310.9 builds. Earlier builds only know 0.
-    pub preset: u32,
-}
-
-/// Live model tuning. These keys are read at evaluation time, so changing
-/// them does not recreate the feature (the model preset does).
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct NrTuning {
-    /// DLSSNR.Style: 0 default, 1 natural, 2 cinematic.
-    pub style: u32,
-    /// DLSSNR.Intensity: overall strength of the model's edit.
-    pub intensity: f32,
-    /// DLSSNR.LocalStructureStrength.
-    pub local_structure: f32,
-    /// DLSSNR.LocalToneStrength.
-    pub local_tone: f32,
-    /// DLSSNR.SkinStructureStrength.
-    pub skin_structure: f32,
-    /// DLSSNR.UseAutoMask.
-    pub auto_mask: bool,
-    /// DLSSNR.UICorrection.
-    pub ui_correction: bool,
-}
-
-impl Default for NrTuning {
-    fn default() -> Self {
-        Self {
-            style: 0,
-            intensity: 1.0,
-            local_structure: 1.0,
-            local_tone: 1.0,
-            skin_structure: 0.0,
-            auto_mask: false,
-            ui_correction: false,
-        }
-    }
 }
 
 /// One same-resolution NR evaluation. All four resources have the size the

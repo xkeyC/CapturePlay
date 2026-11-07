@@ -565,6 +565,7 @@ dependencies = [
  "cp-nvidia",
  "egui",
  "libc",
+ "nr-proto",
  "raw-window-handle",
  "thiserror 2.0.21",
  "tracing",
@@ -1480,8 +1481,13 @@ version = "0.1.0"
 dependencies = [
  "ash",
  "libc",
+ "nr-proto",
  "windows",
 ]
+
+[[package]]
+name = "nr-proto"
+version = "0.1.0"
 
 [[package]]
 name = "nu-ansi-term"

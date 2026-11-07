@@ -120,6 +120,148 @@ impl Texture {
     }
 }
 
+impl Texture {
+    /// An image on memory another process exported as an opaque fd
+    /// (`allocation_size` bytes, dedicated to an identical image), moved to
+    /// `GENERAL` on `cmd`. Takes ownership of `fd` (closed on failure).
+    #[allow(clippy::too_many_arguments)]
+    pub fn import_opaque_fd(
+        gpu: &Gpu,
+        cmd: vk::CommandBuffer,
+        width: u32,
+        height: u32,
+        format: vk::Format,
+        usage: vk::ImageUsageFlags,
+        fd: std::os::fd::OwnedFd,
+        allocation_size: u64,
+    ) -> Result<Self> {
+        use std::os::fd::IntoRawFd as _;
+        let opaque = vk::ExternalMemoryHandleTypeFlags::OPAQUE_FD;
+        let mut external = vk::ExternalMemoryImageCreateInfo::default().handle_types(opaque);
+        let info = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(format)
+            .extent(vk::Extent3D {
+                width,
+                height,
+                depth: 1,
+            })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(usage)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .initial_layout(vk::ImageLayout::UNDEFINED)
+            .push_next(&mut external);
+        let device = gpu.device.clone();
+        // SAFETY: valid create infos; on error everything created so far is
+        // destroyed. A successful import owns the fd, a failed one leaves it
+        // to us (dropped by `fd` until handed over).
+        unsafe {
+            let image = device.create_image(&info, None)?;
+            let req = device.get_image_memory_requirements(image);
+            let Some(index) = gpu.memory_type(
+                req.memory_type_bits,
+                vk::MemoryPropertyFlags::DEVICE_LOCAL,
+                vk::MemoryPropertyFlags::empty(),
+            ) else {
+                device.destroy_image(image, None);
+                return Err(super::VkError::NoMemoryType);
+            };
+            let raw = fd.into_raw_fd();
+            let mut import = vk::ImportMemoryFdInfoKHR::default()
+                .handle_type(opaque)
+                .fd(raw);
+            let mut dedicated = vk::MemoryDedicatedAllocateInfo::default().image(image);
+            let alloc = vk::MemoryAllocateInfo::default()
+                .allocation_size(allocation_size)
+                .memory_type_index(index)
+                .push_next(&mut import)
+                .push_next(&mut dedicated);
+            let memory = match device.allocate_memory(&alloc, None) {
+                Ok(m) => m,
+                Err(e) => {
+                    libc::close(raw);
+                    device.destroy_image(image, None);
+                    return Err(e.into());
+                }
+            };
+            if let Err(e) = device.bind_image_memory(image, memory, 0) {
+                device.destroy_image(image, None);
+                device.free_memory(memory, None);
+                return Err(e.into());
+            }
+            let view = match device.create_image_view(
+                &vk::ImageViewCreateInfo::default()
+                    .image(image)
+                    .view_type(vk::ImageViewType::TYPE_2D)
+                    .format(format)
+                    .subresource_range(COLOR_RANGE),
+                None,
+            ) {
+                Ok(v) => v,
+                Err(e) => {
+                    device.destroy_image(image, None);
+                    device.free_memory(memory, None);
+                    return Err(e.into());
+                }
+            };
+            layout_barrier(
+                &device,
+                cmd,
+                image,
+                vk::ImageLayout::UNDEFINED,
+                vk::ImageLayout::GENERAL,
+            );
+            Ok(Self {
+                device,
+                image,
+                view,
+                memory,
+                format,
+                width,
+                height,
+            })
+        }
+    }
+}
+
+/// Ownership hand-over of `image` (kept in `GENERAL`) with another process
+/// on the same device: `acquire` takes it from the external owner,
+/// otherwise it is released to it.
+pub fn external_barrier(
+    device: &ash::Device,
+    cmd: vk::CommandBuffer,
+    family: u32,
+    image: vk::Image,
+    acquire: bool,
+) {
+    let (src, dst) = if acquire {
+        (vk::QUEUE_FAMILY_EXTERNAL, family)
+    } else {
+        (family, vk::QUEUE_FAMILY_EXTERNAL)
+    };
+    let ib = [vk::ImageMemoryBarrier2::default()
+        .src_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+        .src_access_mask(vk::AccessFlags2::MEMORY_WRITE)
+        .dst_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+        .dst_access_mask(vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE)
+        .old_layout(vk::ImageLayout::GENERAL)
+        .new_layout(vk::ImageLayout::GENERAL)
+        .src_queue_family_index(src)
+        .dst_queue_family_index(dst)
+        .image(image)
+        .subresource_range(COLOR_RANGE)];
+    // SAFETY: recording into an open command buffer.
+    unsafe {
+        device.cmd_pipeline_barrier2(
+            cmd,
+            &vk::DependencyInfo::default().image_memory_barriers(&ib),
+        );
+    }
+}
+
 impl Drop for Texture {
     fn drop(&mut self) {
         // SAFETY: owners keep textures alive until the GPU is done with them.
