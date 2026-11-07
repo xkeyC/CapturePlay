@@ -13,6 +13,10 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy}
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{Fullscreen, Window, WindowId};
 
+/// Wayland app_id and X11 class of the window.
+#[cfg(target_os = "linux")]
+const APP_ID: &str = "capture-play";
+
 use crate::cursor::CursorIdle;
 use crate::render_thread::{self, RenderHandle};
 
@@ -136,6 +140,19 @@ impl App {
 }
 
 impl ApplicationHandler<ToMain> for App {
+    /// The window system connection closes when the event loop returns:
+    /// release what still talks to it now. (egui-winit's Wayland clipboard
+    /// runs a thread that destroys its protocol objects on drop; after the
+    /// connection is gone that crashes.)
+    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        if let Some(r) = self.render.take() {
+            r.shutdown();
+        }
+        self.egui_state = None;
+        self.egui_ctx = None;
+        self.window = None;
+    }
+
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
             return;
@@ -146,6 +163,15 @@ impl ApplicationHandler<ToMain> for App {
         let attrs = Window::default_attributes()
             .with_title("CapturePlay")
             .with_inner_size(winit::dpi::LogicalSize::new(1280.0, 720.0));
+        // A fixed Wayland app_id / X11 class, so compositor window rules
+        // (KWin: per-window adaptive sync) can match the window.
+        #[cfg(target_os = "linux")]
+        let attrs = {
+            use winit::platform::wayland::WindowAttributesExtWayland;
+            use winit::platform::x11::WindowAttributesExtX11;
+            let attrs = WindowAttributesExtWayland::with_name(attrs, APP_ID, "");
+            WindowAttributesExtX11::with_name(attrs, APP_ID, APP_ID)
+        };
         let window = match event_loop.create_window(attrs) {
             Ok(w) => Arc::new(w),
             Err(e) => {

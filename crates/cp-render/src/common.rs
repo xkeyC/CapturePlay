@@ -123,6 +123,10 @@ pub struct EguiFrame<'a> {
 pub struct DecodeParams {
     /// Nits at which SDR white is placed.
     pub sdr_white_nits: f32,
+    /// Output units per nit of absolute-luminance (PQ) content: 1 where
+    /// scRGB is absolute (Windows), `203 / reference` under a compositor
+    /// that maps scRGB relative to its reference white (KWin).
+    pub hdr_scale: f32,
     /// Display peak used for the HLG OOTF.
     pub hlg_peak_nits: f32,
 }

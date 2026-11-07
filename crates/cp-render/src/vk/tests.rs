@@ -258,6 +258,7 @@ fn check_420(format: PixelFormat, color: ColorDesc) {
     )
     .expect("out");
     let params = DecodeParams {
+        hdr_scale: 1.0,
         sdr_white_nits: 203.0,
         hlg_peak_nits: 1000.0,
     };

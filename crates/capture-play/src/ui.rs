@@ -223,7 +223,10 @@ pub fn draw(ctx: &egui::Context, s: &mut Settings, v: &UiView<'_>) -> Vec<Action
     egui::Window::new("CapturePlay")
         .default_pos([16.0, 16.0])
         .default_width(380.0)
-        .resizable(false)
+        // Resizable by dragging its edges; taller content (high scale
+        // factors) scrolls inside the window, which stays on screen.
+        .resizable(true)
+        .vscroll(true)
         .frame(egui::Frame::window(&ctx.global_style()).fill(egui::Color32::from_black_alpha(245)))
         .show(ctx, |ui| {
             ui.small(t.hint);

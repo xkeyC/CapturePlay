@@ -25,7 +25,7 @@ use super::display::{Compositor, DisplayTracker};
 use super::egui_pass::EguiPass;
 use super::output::OutputPass;
 use super::pipeline::Layouts;
-use super::presenter::{OutputEncoding, Presenter};
+use super::presenter::{HdrLevels, OutputEncoding, Presenter};
 use super::recording::Recording;
 use super::texture::{Texture, WORKING_USAGE, layout_barrier};
 use super::timer::GpuTimer;
@@ -735,6 +735,7 @@ impl Renderer {
             80.0
         };
         DecodeParams {
+            hdr_scale: k,
             sdr_white_nits: self
                 .config
                 .sdr_white_override
@@ -748,7 +749,7 @@ impl Renderer {
         let d = self.display.info();
         let sdr_white = self.decode_params().sdr_white_nits;
         let content_peak = match self.stats.color {
-            Some(c) if c.is_hdr() => self.config.hdr_content_peak_nits,
+            Some(c) if c.is_hdr() => self.config.hdr_content_peak_nits * self.encode_scale(),
             _ => sdr_white,
         };
         OutputParams {
@@ -856,6 +857,16 @@ impl Renderer {
         if self.display.update() {
             self.timing.reset();
         }
+        let levels = self.hdr_output().then(|| {
+            let d = self.display.info();
+            let k = self.encode_scale();
+            HdrLevels {
+                max_nits: self.config.peak_override.unwrap_or(d.max_nits) * k,
+                max_frame_average_nits: d.max_full_frame_nits * k,
+                min_nits: d.min_nits * k,
+            }
+        });
+        self.presenter.set_hdr_metadata(&self.gpu, levels);
         let nominal = self.nominal_period_ns();
         let before = self.timing.kind();
         for (id, shown) in self.presenter.poll_timing(&self.gpu) {
