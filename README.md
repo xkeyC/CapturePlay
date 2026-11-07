@@ -28,7 +28,31 @@ CapturePlay 把采集卡当作显示器：主机画面在 PC 上以尽可能低�
 | 音频直通 | 采集卡 HDMI 音频经 WASAPI 输出，带时钟漂移校正 |
 | 界面 | 中文/英文，HDR 后缓冲内绘制，可显示 GPU 耗时与呈现抖动 |
 
-### 1.3 使用
+### 1.3 系统要求与硬件要求
+
+**系统**
+
+| 平台 | 要求 |
+|---|---|
+| Windows | Windows 10/11 x64；HDR 需在系统设置中开启“使用 HDR” |
+| Linux | Wayland 合成器；HDR 需要色彩管理协议（`wp_color_manager_v1`），已测试 KDE Plasma 6.8（KWin）。X11 或无色彩管理时按 SDR 输出。音频需要 PipeWire，采集设备走 V4L2 |
+| Linux 上的 NR | Steam 中的 Proton 11（Wine 10 及以上；已测试 Proton 11.0、GE-Proton11-11、DW-Proton 11.0-16），NixOS 上经 `steam-run` 启动 |
+
+**硬件**
+
+| 功能 | 显卡 | 其他 |
+|---|---|---|
+| 基础播放 | Windows：D3D12 显卡；Linux：Vulkan 1.3 显卡 | HDMI 采集卡（UVC / V4L2） |
+| HDR | — | HDR 显示器；采集 10-bit（P010）信号 |
+| VFG 补帧 | NVIDIA RTX 40/50 | NVIDIA Video Effects 运行库 |
+| VSR 超分 | NVIDIA RTX 20 及以上 | Windows：RTX Video SDK；Linux：Video Effects 运行库（构建时链接 DLSS SDK 的 NGX 静态库） |
+| NR 官方 | NVIDIA RTX 50，驱动暴露 NGX feature 18 | Windows |
+| NR 社区（非官方） | NVIDIA RTX 40/30/20 | 自备 `nvngx_dlssnr.dll`；Windows 需本项目生成的 `captureplay_nvngx.dll`，Linux 需 Proton 与 `captureplay-nr-host.exe` |
+| VRR | — | G-SYNC / FreeSync / HDMI VRR 显示器；Linux 上 KWin 自适应同步设为“自动”（全屏时）或“始终” |
+
+开发与测试环境：RTX 4090，AVerMedia Live Gamer Ultra 2.1（USB 10 Gbps）；Linux 端为 NixOS、NVIDIA 驱动 615、KDE Plasma 6.8。
+
+### 1.4 使用
 
 | 操作 | 快捷键 |
 |---|---|
@@ -43,7 +67,7 @@ CapturePlay 把采集卡当作显示器：主机画面在 PC 上以尽可能低�
 
 NR 面板：后端、模型（Auto / Quality / Performance）、风格（默认 / 自然 / 电影）、模型强度、合成强度；“更多参数”中可调局部结构、局部影调、肤色结构、自动蒙版与 UI 校正。
 
-### 1.4 性能参考
+### 1.5 性能参考
 
 RTX 4090，AVerMedia Live Gamer Ultra 2.1，1440p P010，release 构建：
 
@@ -60,7 +84,7 @@ RTX 4090，AVerMedia Live Gamer Ultra 2.1，1440p P010，release 构建：
 
 以上为特定机器与素材的参考值，实际取决于显卡、采集格式和效果组合。
 
-### 1.5 采集卡与硬件
+### 1.6 采集卡
 
 以 AVerMedia Live Gamer Ultra 2.1 为例：
 
@@ -72,15 +96,7 @@ RTX 4090，AVerMedia Live Gamer Ultra 2.1，1440p P010，release 构建：
 
 该卡（USB 版）不需要设置硬件色调映射；PCIe 型号会自动关闭。
 
-| 功能 | 要求 |
-|---|---|
-| 基础播放 | Windows 10/11 x64，D3D12 显卡 |
-| VFG 补帧 | NVIDIA RTX 40/50 + Video Effects 运行时 |
-| VSR 超分 | NVIDIA RTX 20+ + RTX Video SDK |
-| NR 官方（RTX50） | 驱动/NGX 暴露 feature 18 |
-| NR 社区（Unofficial RTX40/30/20） | 自备社区 `nvngx_dlssnr.dll` + 本项目生成的 `captureplay_nvngx.dll` |
-
-### 1.6 构建与运行
+### 1.7 构建与运行
 
 需求：Rust 1.95+（MSVC）、Windows SDK（`dxc.exe`，可用 `DXC_PATH` 指定）、D3D12 显卡。
 
@@ -110,7 +126,7 @@ VRR 由 KWin 决定：在“显示设置 → 自适应同步”中选“自动�
 
 NR（实验）：NVIDIA 只提供 Windows 版 `nvngx_dlssnr.dll`，Linux 上由 `captureplay-nr-host.exe` 在 Proton 中运行模型（NGX on Vulkan，经 winevulkan），画面与同步通过显存 fd 与 timeline 信号量在两个进程间零拷贝传递，每帧不做 CPU 等待；1440p 推理约 5.7 ms。准备：`rustup target add x86_64-pc-windows-gnu`，在 `nix develop` 中运行 `scripts/build-nr-host.sh`（生成并安装 helper 与 `captureplay_nvngx.dll` 到 `runtime/nvidia-nr/`），再放入自备的 `nvngx_dlssnr.dll`。Proton 默认取 Steam 中最新的版本（NixOS 上自动经 `steam-run`），也可在 `settings.toml` 的 `[enhance]` 中用 `nr_proton = ["steam-run", "/…/proton"]` 与 `nr_proton_prefix` 指定；首次启用需数秒启动 Proton，期间画面直通。helper 日志写在 Wine 前缀目录里的 `captureplay-nr-host.log`（默认 `~/.local/share/CapturePlay/nr-prefix/`）。
 
-### 1.7 注意事项
+### 1.8 注意事项
 
 - HDR 需要显示器与 Windows HDR 同时开启；切换全屏或窗口后交换链会重新应用输出合约。
 - NR 为实验功能；社区运行库未签名、可能崩溃，仅用于学习交流。官方路径取决于 NVIDIA 是否在驱动中开放 feature 18。

@@ -28,7 +28,31 @@ CapturePlay treats the capture card as a display: the console image is presented
 | Audio passthrough | Capture-card HDMI audio through WASAPI, with clock-drift correction |
 | UI | Chinese/English, drawn into the HDR back buffer, with GPU time and present jitter |
 
-### 1.3 Usage
+### 1.3 System and hardware requirements
+
+**System**
+
+| Platform | Requirement |
+|---|---|
+| Windows | Windows 10/11 x64; HDR needs "Use HDR" on in the display settings |
+| Linux | A Wayland compositor; HDR needs the color-management protocol (`wp_color_manager_v1`), tested on KDE Plasma 6.8 (KWin). On X11 or without color management the output is SDR. Audio needs PipeWire; capture goes through V4L2 |
+| NR on Linux | Proton 11 from Steam (Wine 10 or later; tested Proton 11.0, GE-Proton11-11, DW-Proton 11.0-16), started through `steam-run` on NixOS |
+
+**Hardware**
+
+| Feature | GPU | Other |
+|---|---|---|
+| Basic playback | Windows: a D3D12 GPU; Linux: a Vulkan 1.3 GPU | An HDMI capture card (UVC / V4L2) |
+| HDR | — | An HDR display; a 10-bit (P010) capture |
+| VFG interpolation | NVIDIA RTX 40/50 | NVIDIA Video Effects runtime |
+| VSR upscaling | NVIDIA RTX 20 or later | Windows: RTX Video SDK; Linux: the Video Effects runtime (the build links the DLSS SDK's static NGX loader) |
+| NR official | NVIDIA RTX 50 with a driver exposing NGX feature 18 | Windows |
+| NR community (unofficial) | NVIDIA RTX 40/30/20 | User-supplied `nvngx_dlssnr.dll`; on Windows the `captureplay_nvngx.dll` built by this project, on Linux Proton and `captureplay-nr-host.exe` |
+| VRR | — | A G-SYNC / FreeSync / HDMI VRR display; on Linux, KWin adaptive sync set to "Automatic" (fullscreen) or "Always" |
+
+Developed and tested on an RTX 4090 with an AVerMedia Live Gamer Ultra 2.1 (USB 10 Gbps); on Linux with NixOS, NVIDIA driver 615 and KDE Plasma 6.8.
+
+### 1.4 Usage
 
 | Action | Shortcut |
 |---|---|
@@ -43,7 +67,7 @@ Settings live in `%APPDATA%\CapturePlay\settings.toml`; the log is `capture-play
 
 NR panel: backend, model (Auto / Quality / Performance), style (Default / Natural / Cinematic), model strength, composite strength; "More parameters" exposes local structure, local tone, skin structure, auto mask and UI correction.
 
-### 1.4 Performance
+### 1.5 Performance
 
 RTX 4090, AVerMedia Live Gamer Ultra 2.1, 1440p P010, release build:
 
@@ -60,7 +84,7 @@ RTX 4090, AVerMedia Live Gamer Ultra 2.1, 1440p P010, release build:
 
 These are reference numbers for this machine and content. Actual cost depends on the GPU, capture format and effect combination.
 
-### 1.5 Capture cards and hardware
+### 1.6 Capture cards
 
 Taking the AVerMedia Live Gamer Ultra 2.1 as an example:
 
@@ -72,15 +96,7 @@ Taking the AVerMedia Live Gamer Ultra 2.1 as an example:
 
 The USB model needs no hardware tone-mapping setup; PCIe models disable it automatically.
 
-| Feature | Requirement |
-|---|---|
-| Basic playback | Windows 10/11 x64, D3D12 GPU |
-| VFG interpolation | NVIDIA RTX 40/50 + Video Effects runtime |
-| VSR upscaling | NVIDIA RTX 20+ + RTX Video SDK |
-| NR official (RTX50) | Driver/NGX exposes feature 18 |
-| NR community (Unofficial RTX40/30/20) | User-supplied `nvngx_dlssnr.dll` + the `captureplay_nvngx.dll` built by this project |
-
-### 1.6 Build and run
+### 1.7 Build and run
 
 Requirements: Rust 1.95+ (MSVC), Windows SDK (`dxc.exe`, or set `DXC_PATH`), a D3D12 GPU.
 
@@ -110,7 +126,7 @@ VRR is KWin's call: set Display Settings → Adaptive sync to "Automatic" (appli
 
 NR (experimental): NVIDIA ships `nvngx_dlssnr.dll` for Windows only, so on Linux `captureplay-nr-host.exe` runs the model under Proton (NGX on Vulkan through winevulkan); frames and synchronisation cross between the processes as GPU-memory fds and timeline semaphores, with no copies and no per-frame CPU waits; inference takes about 5.7 ms at 1440p. Setup: `rustup target add x86_64-pc-windows-gnu`, run `scripts/build-nr-host.sh` inside `nix develop` (builds the host and `captureplay_nvngx.dll` and installs them into `runtime/nvidia-nr/`), then add your own `nvngx_dlssnr.dll`. Proton defaults to the newest one in Steam (through `steam-run` on NixOS); `nr_proton = ["steam-run", "/…/proton"]` and `nr_proton_prefix` under `[enhance]` in `settings.toml` override it. Enabling NR takes a few seconds to start Proton, with frames passing through meanwhile. The host logs to `captureplay-nr-host.log` in the Wine prefix (default `~/.local/share/CapturePlay/nr-prefix/`).
 
-### 1.7 Notes
+### 1.8 Notes
 
 - HDR requires both the display and Windows HDR to be enabled; the swapchain reapplies its output contract after fullscreen or window changes.
 - NR is experimental. Community runtimes are unsigned and may crash; use them for learning and experimentation only. The official route depends on NVIDIA exposing feature 18 in the driver.
