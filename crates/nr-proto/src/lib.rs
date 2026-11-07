@@ -32,6 +32,8 @@
 
 use std::sync::atomic::{AtomicI32, AtomicU8, AtomicU32, AtomicU64, Ordering};
 
+pub mod dlssnr;
+
 pub const MAGIC: u32 = u32::from_le_bytes(*b"CPNR");
 pub const VERSION: u32 = 1;
 /// Bytes to map (≥ `size_of::<Shared>()`, one page multiple).

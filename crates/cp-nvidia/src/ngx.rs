@@ -635,32 +635,23 @@ mod imp {
         }
     }
 
-    fn fill_create(params: *mut Parameter, width: u32, height: u32, options: NrOptions) {
-        // SAFETY: fresh NGX-owned parameter block; neither the generic nor
-        // the DLSSNR-prefixed size keys are documented, so both are set.
+    /// Sets one `nr_proto::dlssnr` value on an NGX-owned block.
+    fn set_value(params: *mut Parameter, key: &std::ffi::CStr, value: nr_proto::dlssnr::Value) {
+        use nr_proto::dlssnr::Value;
+        // SAFETY: NGX-owned parameter block and a NUL-terminated key.
         unsafe {
-            NVSDK_NGX_Parameter_SetUI(params, c"CreationNodeMask".as_ptr(), 1);
-            NVSDK_NGX_Parameter_SetUI(params, c"VisibilityNodeMask".as_ptr(), 1);
-            NVSDK_NGX_Parameter_SetUI(params, c"Width".as_ptr(), width);
-            NVSDK_NGX_Parameter_SetUI(params, c"Height".as_ptr(), height);
-            NVSDK_NGX_Parameter_SetUI(params, c"OutWidth".as_ptr(), width);
-            NVSDK_NGX_Parameter_SetUI(params, c"OutHeight".as_ptr(), height);
-            NVSDK_NGX_Parameter_SetUI(params, c"DLSSNR.InputWidth".as_ptr(), width);
-            NVSDK_NGX_Parameter_SetUI(params, c"DLSSNR.InputHeight".as_ptr(), height);
-            NVSDK_NGX_Parameter_SetUI(params, c"DLSSNR.OutputWidth".as_ptr(), width);
-            NVSDK_NGX_Parameter_SetUI(params, c"DLSSNR.OutputHeight".as_ptr(), height);
-            NVSDK_NGX_Parameter_SetUI(params, c"DLSSNR.Width".as_ptr(), width);
-            NVSDK_NGX_Parameter_SetUI(params, c"DLSSNR.Height".as_ptr(), height);
-            NVSDK_NGX_Parameter_SetI(params, c"DLSSNR.Enabled".as_ptr(), 1);
-            NVSDK_NGX_Parameter_SetI(params, c"DLSSNR.Upscaling".as_ptr(), 0);
-            NVSDK_NGX_Parameter_SetF(params, c"DLSSNR.Scale".as_ptr(), 1.0);
-            NVSDK_NGX_Parameter_SetF(params, c"DLSSNR.ScalingRatio".as_ptr(), 1.0);
-            NVSDK_NGX_Parameter_SetI(
-                params,
-                c"DLSSNR.Hint.Render.Preset".as_ptr(),
-                options.preset as i32,
-            );
+            match value {
+                Value::U32(v) => NVSDK_NGX_Parameter_SetUI(params, key.as_ptr(), v),
+                Value::I32(v) => NVSDK_NGX_Parameter_SetI(params, key.as_ptr(), v),
+                Value::F32(v) => NVSDK_NGX_Parameter_SetF(params, key.as_ptr(), v),
+            }
         }
+    }
+
+    fn fill_create(params: *mut Parameter, width: u32, height: u32, options: NrOptions) {
+        nr_proto::dlssnr::create(width, height, options.preset, &mut |k, v| {
+            set_value(params, k, v);
+        });
     }
 
     fn fill_eval(params: *mut Parameter, frame: &NrFrame<'_>) {
@@ -673,6 +664,9 @@ mod imp {
         };
         let (w, h) = size(frame.color);
         let out = size(frame.output);
+        nr_proto::dlssnr::evaluate((w, h), out, frame.reset, &frame.tuning, &mut |k, v| {
+            set_value(params, k, v);
+        });
         // SAFETY: NGX-owned parameter block; the resources outlive the
         // recorded command list (owned by the caller's frame).
         unsafe {
@@ -695,51 +689,6 @@ mod imp {
                 params,
                 c"DLSSNR.Output".as_ptr(),
                 frame.output.as_raw(),
-            );
-            NVSDK_NGX_Parameter_SetI(params, c"DLSSNR.Enabled".as_ptr(), 1);
-            NVSDK_NGX_Parameter_SetI(params, c"DLSSNR.Reset".as_ptr(), i32::from(frame.reset));
-            NVSDK_NGX_Parameter_SetI(params, c"DLSSNR.DepthInverted".as_ptr(), 0);
-            NVSDK_NGX_Parameter_SetUI(params, c"DLSSNR.ColorSubrectBaseX".as_ptr(), 0);
-            NVSDK_NGX_Parameter_SetUI(params, c"DLSSNR.ColorSubrectBaseY".as_ptr(), 0);
-            NVSDK_NGX_Parameter_SetUI(params, c"DLSSNR.ColorSubrectWidth".as_ptr(), w);
-            NVSDK_NGX_Parameter_SetUI(params, c"DLSSNR.ColorSubrectHeight".as_ptr(), h);
-            NVSDK_NGX_Parameter_SetUI(params, c"DLSSNR.DepthSubrectBaseX".as_ptr(), 0);
-            NVSDK_NGX_Parameter_SetUI(params, c"DLSSNR.DepthSubrectBaseY".as_ptr(), 0);
-            NVSDK_NGX_Parameter_SetUI(params, c"DLSSNR.DepthSubrectWidth".as_ptr(), w);
-            NVSDK_NGX_Parameter_SetUI(params, c"DLSSNR.DepthSubrectHeight".as_ptr(), h);
-            NVSDK_NGX_Parameter_SetUI(params, c"DLSSNR.MVecSubrectBaseX".as_ptr(), 0);
-            NVSDK_NGX_Parameter_SetUI(params, c"DLSSNR.MVecSubrectBaseY".as_ptr(), 0);
-            NVSDK_NGX_Parameter_SetUI(params, c"DLSSNR.MVecSubrectWidth".as_ptr(), w);
-            NVSDK_NGX_Parameter_SetUI(params, c"DLSSNR.MVecSubrectHeight".as_ptr(), h);
-            NVSDK_NGX_Parameter_SetUI(params, c"DLSSNR.OutputSubrectBaseX".as_ptr(), 0);
-            NVSDK_NGX_Parameter_SetUI(params, c"DLSSNR.OutputSubrectBaseY".as_ptr(), 0);
-            NVSDK_NGX_Parameter_SetUI(params, c"DLSSNR.OutputSubrectWidth".as_ptr(), out.0);
-            NVSDK_NGX_Parameter_SetUI(params, c"DLSSNR.OutputSubrectHeight".as_ptr(), out.1);
-            NVSDK_NGX_Parameter_SetF(params, c"DLSSNR.MVecScaleX".as_ptr(), 1.0);
-            NVSDK_NGX_Parameter_SetF(params, c"DLSSNR.MVecScaleY".as_ptr(), 1.0);
-            let t = frame.tuning;
-            NVSDK_NGX_Parameter_SetUI(params, c"DLSSNR.Style".as_ptr(), t.style);
-            NVSDK_NGX_Parameter_SetF(params, c"DLSSNR.Intensity".as_ptr(), t.intensity);
-            NVSDK_NGX_Parameter_SetF(
-                params,
-                c"DLSSNR.LocalStructureStrength".as_ptr(),
-                t.local_structure,
-            );
-            NVSDK_NGX_Parameter_SetF(params, c"DLSSNR.LocalToneStrength".as_ptr(), t.local_tone);
-            NVSDK_NGX_Parameter_SetF(
-                params,
-                c"DLSSNR.SkinStructureStrength".as_ptr(),
-                t.skin_structure,
-            );
-            NVSDK_NGX_Parameter_SetUI(
-                params,
-                c"DLSSNR.UseAutoMask".as_ptr(),
-                u32::from(t.auto_mask),
-            );
-            NVSDK_NGX_Parameter_SetUI(
-                params,
-                c"DLSSNR.UICorrection".as_ptr(),
-                u32::from(t.ui_correction),
             );
         }
     }

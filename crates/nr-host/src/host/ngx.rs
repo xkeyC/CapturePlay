@@ -159,29 +159,16 @@ pub fn resource(img: &Image, read_write: bool) -> ResourceVk {
     }
 }
 
-/// Live model tuning, as in cp-nvidia's `NrTuning`.
-#[derive(Debug, Clone, Copy)]
-pub struct Tuning {
-    pub style: u32,
-    pub intensity: f32,
-    pub local_structure: f32,
-    pub local_tone: f32,
-    pub skin_structure: f32,
-    pub auto_mask: bool,
-    pub ui_correction: bool,
-}
+/// Live model tuning (the shared DLSSNR parameter list).
+pub use nr_proto::dlssnr::Tuning;
 
-impl Default for Tuning {
-    fn default() -> Self {
-        Self {
-            style: 0,
-            intensity: 1.0,
-            local_structure: 1.0,
-            local_tone: 1.0,
-            skin_structure: 0.0,
-            auto_mask: false,
-            ui_correction: false,
-        }
+/// Sets one `nr_proto::dlssnr` value.
+fn set_value(p: &Params, key: &std::ffi::CStr, value: nr_proto::dlssnr::Value) {
+    use nr_proto::dlssnr::Value;
+    match value {
+        Value::U32(v) => p.set_u32(key, v),
+        Value::I32(v) => p.set_i32(key, v),
+        Value::F32(v) => p.set_f32(key, v),
     }
 }
 
@@ -210,27 +197,7 @@ impl<'b> Feature<'b> {
         preset: u32,
     ) -> Result<Self> {
         let p = Params::new();
-        p.set_u32(c"CreationNodeMask", 1);
-        p.set_u32(c"VisibilityNodeMask", 1);
-        for (key, v) in [
-            (c"Width", width),
-            (c"Height", height),
-            (c"OutWidth", width),
-            (c"OutHeight", height),
-            (c"DLSSNR.InputWidth", width),
-            (c"DLSSNR.InputHeight", height),
-            (c"DLSSNR.OutputWidth", width),
-            (c"DLSSNR.OutputHeight", height),
-            (c"DLSSNR.Width", width),
-            (c"DLSSNR.Height", height),
-        ] {
-            p.set_u32(key, v);
-        }
-        p.set_i32(c"DLSSNR.Enabled", 1);
-        p.set_i32(c"DLSSNR.Upscaling", 0);
-        p.set_f32(c"DLSSNR.Scale", 1.0);
-        p.set_f32(c"DLSSNR.ScalingRatio", 1.0);
-        p.set_i32(c"DLSSNR.Hint.Render.Preset", preset as i32);
+        nr_proto::dlssnr::create(width, height, preset, &mut |k, v| set_value(&p, k, v));
         let mut handle = std::ptr::null_mut();
         // SAFETY: recording command buffer, live parameter block.
         let r = unsafe {
@@ -266,33 +233,13 @@ impl<'b> Feature<'b> {
         p.set_ptr(c"DLSSNR.Depth", (&raw mut depth).cast());
         p.set_ptr(c"DLSSNR.MVec", (&raw mut motion).cast());
         p.set_ptr(c"DLSSNR.Output", (&raw mut output).cast());
-        let (w, h) = (f.color.width, f.color.height);
-        let (ow, oh) = (f.output.width, f.output.height);
-        p.set_i32(c"DLSSNR.Enabled", 1);
-        p.set_i32(c"DLSSNR.Reset", i32::from(f.reset));
-        p.set_i32(c"DLSSNR.DepthInverted", 0);
-        for (prefix, (sw, sh)) in [
-            ("Color", (w, h)),
-            ("Depth", (w, h)),
-            ("MVec", (w, h)),
-            ("Output", (ow, oh)),
-        ] {
-            for (field, v) in [("BaseX", 0), ("BaseY", 0), ("Width", sw), ("Height", sh)] {
-                let key = std::ffi::CString::new(format!("DLSSNR.{prefix}Subrect{field}"))
-                    .expect("no NUL in key");
-                p.set_u32(&key, v);
-            }
-        }
-        p.set_f32(c"DLSSNR.MVecScaleX", 1.0);
-        p.set_f32(c"DLSSNR.MVecScaleY", 1.0);
-        let t = f.tuning;
-        p.set_u32(c"DLSSNR.Style", t.style);
-        p.set_f32(c"DLSSNR.Intensity", t.intensity);
-        p.set_f32(c"DLSSNR.LocalStructureStrength", t.local_structure);
-        p.set_f32(c"DLSSNR.LocalToneStrength", t.local_tone);
-        p.set_f32(c"DLSSNR.SkinStructureStrength", t.skin_structure);
-        p.set_i32(c"DLSSNR.UseAutoMask", i32::from(t.auto_mask));
-        p.set_i32(c"DLSSNR.UICorrection", i32::from(t.ui_correction));
+        nr_proto::dlssnr::evaluate(
+            (f.color.width, f.color.height),
+            (f.output.width, f.output.height),
+            f.reset,
+            &f.tuning,
+            &mut |k, v| set_value(p, k, v),
+        );
         // SAFETY: recording command buffer; the resource structs are read
         // during the call, the images outlive the submission.
         let r = unsafe {
