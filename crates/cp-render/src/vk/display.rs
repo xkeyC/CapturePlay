@@ -19,6 +19,11 @@
 //! business (it creates those objects for the IMMEDIATE / FIFO present
 //! modes; a second one would be a protocol error).
 //!
+//! While the capture shows a picture the renderer keeps the session awake
+//! with an idle inhibitor on the surface (`zwp_idle_inhibit_manager_v1`):
+//! the compositor then neither blanks nor locks the screen while the window
+//! is visible.
+//!
 //! The protocol objects live on their own event queue of the window's
 //! `wl_display`. The window thread's event loop reads the socket and
 //! libwayland routes our events to that queue; the render thread only
@@ -45,6 +50,10 @@ use wayland_protocols::wp::color_management::v1::client::{
 use wayland_protocols::wp::content_type::v1::client::{
     wp_content_type_manager_v1::{self, WpContentTypeManagerV1},
     wp_content_type_v1::{self, WpContentTypeV1},
+};
+use wayland_protocols::wp::idle_inhibit::zv1::client::{
+    zwp_idle_inhibit_manager_v1::{self, ZwpIdleInhibitManagerV1},
+    zwp_idle_inhibitor_v1::{self, ZwpIdleInhibitorV1},
 };
 
 use self::kde::{
@@ -136,6 +145,7 @@ const OUTPUT_REGISTRY_MIN_VERSION: u32 = 21;
 struct State {
     manager: Option<(u32, u32)>,
     content_type: Option<(u32, u32)>,
+    idle_inhibit: Option<(u32, u32)>,
     outputs: Vec<OutputDevice>,
     partial: Luminances,
     /// Completed information of the latest preferred description.
@@ -174,6 +184,8 @@ impl Dispatch<WlRegistry, ()> for State {
                     state.manager = Some((name, version));
                 } else if interface == WpContentTypeManagerV1::interface().name {
                     state.content_type = Some((name, version));
+                } else if interface == ZwpIdleInhibitManagerV1::interface().name {
+                    state.idle_inhibit = Some((name, version));
                 } else if interface == KdeOutputDeviceRegistryV2::interface().name
                     && version >= OUTPUT_REGISTRY_MIN_VERSION
                 {
@@ -292,6 +304,30 @@ impl Dispatch<WpContentTypeManagerV1, ()> for State {
     }
 }
 
+impl Dispatch<ZwpIdleInhibitManagerV1, ()> for State {
+    fn event(
+        _: &mut Self,
+        _: &ZwpIdleInhibitManagerV1,
+        _: zwp_idle_inhibit_manager_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<ZwpIdleInhibitorV1, ()> for State {
+    fn event(
+        _: &mut Self,
+        _: &ZwpIdleInhibitorV1,
+        _: zwp_idle_inhibitor_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
 impl Dispatch<WpContentTypeV1, ()> for State {
     fn event(
         _: &mut Self,
@@ -403,6 +439,10 @@ pub struct Compositor {
     color: Option<(WpColorManagerV1, WpColorManagementSurfaceFeedbackV1)>,
     /// Kept alive: destroying it resets the content type.
     content_type: Option<(WpContentTypeManagerV1, WpContentTypeV1)>,
+    surface: WlSurface,
+    idle_manager: Option<ZwpIdleInhibitManagerV1>,
+    /// Present while the session is kept awake.
+    idle_inhibitor: Option<ZwpIdleInhibitorV1>,
 }
 
 impl std::fmt::Debug for Compositor {
@@ -454,12 +494,18 @@ impl Compositor {
             ct.set_content_type(wp_content_type_v1::Type::Game);
             (manager, ct)
         });
+        let idle_manager = state.idle_inhibit.map(|(name, version)| {
+            registry.bind::<ZwpIdleInhibitManagerV1, _, _>(name, version.min(1), &qh, ())
+        });
         let mut c = Self {
             conn,
             queue,
             state,
             color,
             content_type,
+            surface,
+            idle_manager,
+            idle_inhibitor: None,
         };
         c.request();
         // Output-device properties; ready → get_information → done: a few
@@ -497,6 +543,25 @@ impl Compositor {
         self.state.done.take()
     }
 
+    /// Keeps the session from idling (screen blanking, locking) while `on`
+    /// and the window is visible. False when the compositor cannot.
+    fn set_idle_inhibit(&mut self, on: bool) -> bool {
+        let Some(manager) = &self.idle_manager else {
+            return false;
+        };
+        match (on, self.idle_inhibitor.take()) {
+            (true, None) => {
+                let qh = self.queue.handle();
+                self.idle_inhibitor = Some(manager.create_inhibitor(&self.surface, &qh, ()));
+            }
+            (true, Some(i)) => self.idle_inhibitor = Some(i),
+            (false, Some(i)) => i.destroy(),
+            (false, None) => {}
+        }
+        let _ = self.conn.flush();
+        true
+    }
+
     /// The compositor's VRR policy for the output named `connector`.
     fn vrr(&self, connector: &str) -> Option<CompositorVrr> {
         self.state
@@ -514,6 +579,12 @@ impl Drop for Compositor {
             feedback.destroy();
             manager.destroy();
         }
+        if let Some(i) = self.idle_inhibitor.take() {
+            i.destroy();
+        }
+        if let Some(m) = self.idle_manager.take() {
+            m.destroy();
+        }
         if let Some((manager, ct)) = self.content_type.take() {
             ct.destroy();
             manager.destroy();
@@ -530,6 +601,7 @@ pub struct DisplayTracker {
     monitor: Option<(String, f64)>,
     info: DisplayInfo,
     vrr: Option<CompositorVrr>,
+    inhibit_warned: bool,
 }
 
 impl DisplayTracker {
@@ -540,6 +612,7 @@ impl DisplayTracker {
             monitor: None,
             info: DisplayInfo::fallback(),
             vrr: None,
+            inhibit_warned: false,
         };
         if let Some(l) = t.compositor.as_mut().and_then(|c| c.state.done.take()) {
             t.luminances = Some(l);
@@ -551,6 +624,20 @@ impl DisplayTracker {
 
     /// The compositor's variable-refresh policy for our output, when it
     /// publishes one (KWin).
+    /// Keeps the session awake while `on` (see the module docs).
+    pub fn set_idle_inhibit(&mut self, on: bool) {
+        let ok = self
+            .compositor
+            .as_mut()
+            .is_some_and(|c| c.set_idle_inhibit(on));
+        if on && !ok && !self.inhibit_warned {
+            self.inhibit_warned = true;
+            tracing::warn!(
+                "the compositor cannot inhibit idling; the screen may lock while playing"
+            );
+        }
+    }
+
     pub fn vrr(&self) -> Option<CompositorVrr> {
         self.vrr
     }

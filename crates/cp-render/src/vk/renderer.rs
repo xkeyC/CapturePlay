@@ -235,6 +235,8 @@ pub struct Renderer {
     last_present_ns: i64,
     /// The window is fullscreen (KWin's automatic VRR applies).
     fullscreen: bool,
+    /// The session is kept from idling (see [`Self::set_keep_awake`]).
+    keep_awake: bool,
     gpu: Gpu,
 }
 
@@ -341,6 +343,7 @@ impl Renderer {
             next_id: 1,
             last_present_ns: 0,
             fullscreen: false,
+            keep_awake: false,
             gpu,
         })
     }
@@ -653,6 +656,15 @@ impl Renderer {
     }
 
     /// The window entered or left fullscreen.
+    /// Keeps the screen from blanking or locking while `on` (the capture
+    /// shows a picture), through the compositor's idle inhibition.
+    pub fn set_keep_awake(&mut self, on: bool) {
+        if on != self.keep_awake {
+            self.keep_awake = on;
+            self.display.set_idle_inhibit(on);
+        }
+    }
+
     pub fn set_fullscreen(&mut self, on: bool) {
         if on != self.fullscreen {
             self.fullscreen = on;

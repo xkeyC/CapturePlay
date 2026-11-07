@@ -263,6 +263,8 @@ pub struct Renderer {
     /// Arrival time of each pooled frame id, for latency stats.
     arrivals: Vec<(u64, HostTime)>,
     next_id: u64,
+    /// The display and system are kept awake (see [`Self::set_keep_awake`]).
+    keep_awake: bool,
     gpu: Gpu,
 }
 
@@ -380,8 +382,29 @@ impl Renderer {
             stats: RenderStats::default(),
             arrivals: Vec::new(),
             next_id: 1,
+            keep_awake: false,
             gpu,
         })
+    }
+
+    /// Keeps the display on and the system awake (no screen saver, lock or
+    /// sleep) while `on` — the capture shows a picture. Execution state is
+    /// per thread: call it from the render thread, which owns the renderer.
+    pub fn set_keep_awake(&mut self, on: bool) {
+        use windows::Win32::System::Power::{
+            ES_CONTINUOUS, ES_DISPLAY_REQUIRED, ES_SYSTEM_REQUIRED, SetThreadExecutionState,
+        };
+        if on == self.keep_awake {
+            return;
+        }
+        self.keep_awake = on;
+        let flags = if on {
+            ES_CONTINUOUS | ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED
+        } else {
+            ES_CONTINUOUS
+        };
+        // SAFETY: plain call; it only changes this thread's execution state.
+        unsafe { SetThreadExecutionState(flags) };
     }
 
     pub fn gpu(&self) -> &Gpu {

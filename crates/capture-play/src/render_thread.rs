@@ -1055,8 +1055,13 @@ fn run(
             }
         }
 
-        // UI.
+        // Keep the screen from blanking or locking while the capture shows a
+        // picture (not when the card idles without a signal).
         meter.update(&st.renderer.stats());
+        st.renderer
+            .set_keep_awake(st.capture.is_some() && meter.rates.capture_fps > 1.0);
+
+        // UI.
         let run_ui = overlay && (pending_input.is_some() || Instant::now() >= repaint_at);
         if run_ui {
             let mut input = match pending_input.take() {
